@@ -27,6 +27,7 @@ type CellError = variant {
     reason : text;
   };
   Unauthorized;
+  Transport : text;
   InvalidArgument : text;
   Database : text;
 };

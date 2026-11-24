@@ -1,3 +1,15 @@
+export {
+  CandidActorTransport,
+  decodeSqlValue,
+  encodeSqlParam,
+  unwrapCandidResult,
+  type CandidCellError,
+  type CandidFencing,
+  type CandidResult,
+  type CandidSqlValue,
+  type CanisterActor,
+} from "./candid.ts";
+
 export type SqlParam = null | number | bigint | string | Uint8Array;
 
 export type Consistency = "strong" | "eventual";

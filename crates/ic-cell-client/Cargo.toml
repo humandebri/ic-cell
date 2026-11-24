@@ -4,11 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["ic-agent"]
+ic-agent = ["dep:ic-agent", "dep:tokio"]
+
 [dependencies]
 candid.workspace = true
+ic-agent = { version = "0.40", optional = true }
 ic-cell-canister = { path = "../ic-cell-canister" }
 serde.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 
 [dev-dependencies]
 ic-sqlite-vfs = { git = "https://github.com/humandebri/ic-sqlite-vfs.git", rev = "acdc6b0", default-features = false, features = ["sqlite-bundled"] }
