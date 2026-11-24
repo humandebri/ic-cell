@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Run Rust workspace tests
+        run: cargo test --workspace -- --test-threads=1
+      - name: Check wasm32 canister build
+        run: cargo check -p ic-cell-canister --target wasm32-unknown-unknown
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run TypeScript SDK tests
+        run: node --experimental-strip-types --test packages/typescript-sdk/test/sdk.test.ts
+      - name: Run examples
+        run: |
+          node --experimental-strip-types examples/durable-counter/index.ts
+          node --experimental-strip-types examples/immortal-agent/index.ts

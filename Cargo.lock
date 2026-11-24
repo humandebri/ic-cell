@@ -361,6 +361,7 @@ dependencies = [
 [[package]]
 name = "ic-sqlite-vfs"
 version = "2.1.0"
+source = "git+https://github.com/humandebri/ic-sqlite-vfs.git?rev=acdc6b0#acdc6b096422dab7b482f20dc7a993f3043d971f"
 dependencies = [
  "candid",
  "cc",

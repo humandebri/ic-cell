@@ -14,10 +14,10 @@ serde.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-ic-sqlite-vfs = { path = "../../../ic-sqlite-vfs", default-features = false, features = ["sqlite-precompiled"] }
+ic-sqlite-vfs = { git = "https://github.com/humandebri/ic-sqlite-vfs.git", rev = "acdc6b0", default-features = false, features = ["sqlite-precompiled"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ic-sqlite-vfs = { path = "../../../ic-sqlite-vfs", default-features = false, features = ["sqlite-bundled"] }
+ic-sqlite-vfs = { git = "https://github.com/humandebri/ic-sqlite-vfs.git", rev = "acdc6b0", default-features = false, features = ["sqlite-bundled"] }
 
 [dev-dependencies]
 serial_test = "3"
