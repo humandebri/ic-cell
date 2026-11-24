@@ -1,0 +1,15 @@
+[package]
+name = "ic-cell-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+candid.workspace = true
+ic-cell-canister = { path = "../ic-cell-canister" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ic-sqlite-vfs = { path = "../../../ic-sqlite-vfs", default-features = false, features = ["sqlite-bundled"] }
+serial_test = "3"

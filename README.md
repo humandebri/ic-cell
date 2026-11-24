@@ -1,0 +1,138 @@
+# ic-cell
+
+> **Run anywhere. Persist on-chain.**
+
+**ic-cell** は、[denoland/celld](https://github.com/denoland/celld) の高速なオフチェーン実行環境（Cloudflare Workers / Durable Objects 互換）と、[humandebri/ic-sqlite-vfs](https://github.com/humandebri/ic-sqlite-vfs) による Internet Computer (ICP) 上の永続化・合意済み状態を組み合わせた **ICP-backed Durable Objects** 基盤です。
+
+実行環境は自由に選べる（Self-hosted）一方で、重要な状態は ICP のコンセンサスと Stable Memory 上に永続化されます。
+
+---
+
+## 位置づけ
+
+| システム | 実行環境 | 状態の永続化 |
+| --- | --- | --- |
+| Cloudflare Durable Objects | Cloudflare | Cloudflare |
+| celld | Self-hosted | Object Storage (S3 等) |
+| ICP Canister | ICP | ICP |
+| **ic-cell** | **Self-hosted** | **ICP** |
+
+---
+
+## なぜ celld × ic-sqlite-vfs なのか
+
+両者はストレージの設計思想に強い共通点を持っています。
+
+| 特性 | celld | ic-sqlite-vfs |
+| --- | --- | --- |
+| 状態管理 | Cell | Canister |
+| データベース | SQLite | SQLite |
+| 書き込みモデル | Single writer | 同期的な update 内での直列実行 |
+| 永続化 | Object Storage + LTX | IC Stable Memory |
+| 整合性の基盤 | CAS・Lease・Epoch | IC Consensus |
+| データアクセス | ローカル SQLite | カスタム VFS |
+| 障害復旧 | LTX による復元 | Canister の複製状態 |
+| 実行環境 | V8 / Workers | Wasm / IC |
+
+`celld` が外部ストレージと所有権管理によって実現している性質の一部を、ICP はプロトコルレベルで提供しています。一方で、`celld` は WAL と LTX を利用するのに対し、`ic-sqlite-vfs` は WAL を無効化しているため、VFS を単純に差し替えるのではなく、適切なレイヤーで接続します。
+
+---
+
+## 開発者体験（目標イメージ）
+
+アプリケーション開発者は Canister の Stable Memory、Candid、VFS の内部構造を意識せず、Durable Objects 互換のスタイルで ICP 上に状態を永続化できます。
+
+```ts
+export class Agent extends DurableObject {
+  async saveMemory(key: string, value: string) {
+    await this.env.IC_DB.execute(
+      "INSERT INTO memories (key, value) VALUES (?, ?)",
+      [key, value],
+    );
+  }
+}
+```
+
+- **celld**: LLM 呼び出し、外部 API、WebSocket、スケジューリング、キャッシュ、ルーティングを担当
+- **ICP (Canister)**: 記憶、タスク状態、権限、実行履歴などの「正本（Source of Truth）」を担当
+
+---
+
+## 設計原則
+
+1. **データの正本を単一化する**
+   - 二重書き込みによる不整合を避けるため、MVP では **ICP を正本** とし、`celld` 側のローカル SQLite はキャッシュとして扱います。
+2. **独立した SDK から始める**
+   - 最初から `celld` を fork せず、`ic-cell` として独立した Canister / Client / TypeScript SDK を構築し、段階的に LTX 連携や `StorageBackend::Ic` へ拡張します。
+3. **保証境界を明確にする**
+   - ICP が保証するのは「確定済み状態の永続化・合意・権限制御」であり、オフチェーン実行（LLM 推論など）自体の計算正当性までは保証しません。
+
+---
+
+## 4つの統合アプローチと採用方針
+
+`ic-cell` では、小さく実用化できる構成から始め、最終的にストレージ・レプリケーション層まで発展させます。
+
+1. **ICP Native Storage Binding（MVP の起点）** — Workers / Durable Objects から `ic-sqlite-vfs` 搭載 Canister を直接操作する SDK (`IC_DB`) を提供
+2. **LTX → ICP Replication（中核技術）** — `celld` の SQLite ページ差分（LTX）を ICP に転送し、Canister 内で直接 SQL 照会可能なミラーを維持
+3. **ICP Object Storage Backend（互換拡張）** — `celld` の `StorageBackend` に `Ic` を追加し、S3 互換のオブジェクト・CAS・所有権管理を Canister で提供
+4. **ICP Ownership Coordinator（必要に応じて検討）** — owner record と fencing epoch のみを Canister に分離
+
+---
+
+## リポジトリ構成（計画）
+
+```text
+ic-cell/
+├── crates/
+│   ├── ic-cell-canister/     # ic-sqlite-vfs を使った状態管理・所有権・CAS Canister
+│   │   ├── src/
+│   │   │   ├── storage.rs
+│   │   │   ├── ownership.rs
+│   │   │   └── lib.rs
+│   └── ic-cell-client/       # Rust クライアント / LTX アダプタ
+├── packages/
+│   └── typescript-sdk/       # Workers / Durable Objects 向け IC_DB バインディング
+├── examples/
+│   ├── durable-counter/      # 最小構成サンプル
+│   └── immortal-agent/       # サーバーが消えても状態が残る AI Agent デモ
+├── tests/
+│   ├── concurrent-cas/       # 競合書き込み・CAS 検証
+│   ├── node-failover/        # ノード障害・フェイルオーバー検証
+│   └── recovery/             # 状態復元・整合性検証
+└── docs/
+    └── PLAN.md               # 詳細な実装計画・技術課題
+```
+
+---
+
+## ロードマップ
+
+詳細なタスク・技術設計・完了条件は [docs/PLAN.md](./docs/PLAN.md) を参照してください。
+
+| Phase | 内容 | ゴール |
+| --- | --- | --- |
+| **Phase 1** | 状態管理 Canister (`ic-cell-canister`) | `ic-sqlite-vfs` 上で SQL 実行・CAS・Epoch 管理が動作する |
+| **Phase 2** | Client & TypeScript SDK | `celld` / Workers から `IC_DB` 経由で読み書きできる |
+| **Phase 3** | サンプル実装 (`durable-counter` / `immortal-agent`) | ノード再起動・切替後も Agent の記憶とタスクが復元される |
+| **Phase 4** | Epoch・冪等性・障害復旧テスト | 競合 CAS、フェイルオーバー、タイムアウト後の整合性を自動検証 |
+| **Phase 5** | LTX Replication Adapter | `celld` のページ差分を ICP 側 SQLite イメージへ安全に適用 |
+| **Phase 6** | ICP Object Storage Backend | `celld` の `StorageBackend::Ic` として永続化バックエンド化 |
+
+---
+
+## 主なユースケース
+
+- **Immortal AI Agent**: 1 Agent = 1 Cell。実行ノードが消失しても、別ノードから確定済みの記憶・タスク状態を復元して継続稼働
+- **Verifiable SQLite / Time Machine**: オフチェーンで高速に動く DB の履歴・監査・復元をオンチェーンで担保
+- **Durable Workflow Engine**: 長期間稼働する自動処理の状態管理
+- **Personal Data Pod**: 実行基盤にロックインされない個人所有の永続データベース
+
+---
+
+## 関連リンク
+
+- [実装計画 (docs/PLAN.md)](./docs/PLAN.md)
+- [Architecture Decision Records (docs/adr/)](./docs/adr/README.md)
+- [denoland/celld](https://github.com/denoland/celld)
+- [humandebri/ic-sqlite-vfs](https://github.com/humandebri/ic-sqlite-vfs)
