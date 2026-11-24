@@ -1,3 +1,5 @@
+#[cfg(feature = "ic-agent")]
+pub mod ic_agent;
 pub mod in_process;
 pub mod ltx;
 pub mod object_store;
@@ -155,6 +157,36 @@ impl<T: IcCellTransport> IcCellClient<T> {
     ) -> Result<ExecResult, CellError> {
         self.transport
             .sql_execute(sql.into(), args, idempotency_key, fencing)
+    }
+
+    /// Executes a SQL write with an idempotency key, retrying transient
+    /// transport/database errors up to `max_retries` times without risking
+    /// duplicate application (ADR-0002).
+    pub fn execute_idempotent_with_retry(
+        &self,
+        sql: impl Into<String>,
+        args: Vec<SqlValue>,
+        idempotency_key: impl Into<String>,
+        fencing: Option<FencingToken>,
+        max_retries: usize,
+    ) -> Result<ExecResult, CellError> {
+        let sql = sql.into();
+        let key = idempotency_key.into();
+        let mut attempt = 0;
+        loop {
+            match self.transport.sql_execute(
+                sql.clone(),
+                args.clone(),
+                Some(key.clone()),
+                fencing.clone(),
+            ) {
+                Ok(res) => return Ok(res),
+                Err(CellError::Database(_)) if attempt < max_retries => {
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     pub fn query(
