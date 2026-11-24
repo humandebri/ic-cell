@@ -45,6 +45,7 @@ export type CandidCellError =
   | { NotOwner: { cell_id: string } }
   | { ReplicationMismatch: { reason: string } }
   | { Unauthorized: null }
+  | { Transport: string }
   | { InvalidArgument: string }
   | { Database: string };
 
@@ -89,7 +90,7 @@ export function encodeSqlParam(param: SqlParam): CandidSqlValue {
   if (param === null) return { Null: null };
   if (typeof param === "bigint") return { Integer: param };
   if (typeof param === "number") {
-    return Number.isInteger(param) ? { Integer: BigInt(param) } : { Real: param };
+    return Number.isSafeInteger(param) ? { Integer: BigInt(param) } : { Real: param };
   }
   if (typeof param === "string") return { Text: param };
   return { Blob: param };
@@ -116,6 +117,9 @@ export function unwrapCandidResult<T>(res: CandidResult<T>): T {
   }
   if ("Unauthorized" in err) {
     throw new IcCellError("UNAUTHORIZED", "Caller is not authorized");
+  }
+  if ("Transport" in err) {
+    throw new IcCellError("TRANSPORT", err.Transport);
   }
   if ("AlreadyExists" in err) {
     throw new IcCellError("ALREADY_EXISTS", `Key already exists: ${err.AlreadyExists.key}`);

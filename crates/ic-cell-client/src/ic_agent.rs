@@ -5,53 +5,95 @@ use crate::{
     LtxDeltaRequest, ObjectMeta, ObjectRecord, QueryResult, ReplicationState, SqlValue,
 };
 use candid::{decode_one, encode_args, CandidType, Principal};
-use ic_agent::Agent;
+use ic_agent::{Agent, Identity};
 use serde::de::DeserializeOwned;
-use tokio::runtime::Runtime;
+use std::future::Future;
+use tokio::runtime::{Handle, Runtime};
 
 pub struct IcAgentTransport {
     agent: Agent,
     canister_id: Principal,
-    runtime: Runtime,
+    runtime: Option<Runtime>,
 }
 
 impl IcAgentTransport {
-    /// Connects to an IC replica (e.g. `http://127.0.0.1:4943` or `https://icp-api.io`).
+    /// Connects to an IC replica with an anonymous identity.
     /// Set `fetch_root_key = true` for local `dfx` / PocketIC replicas; keep `false` for mainnet.
     pub fn connect(
         url: &str,
         canister_id: Principal,
         fetch_root_key: bool,
     ) -> Result<Self, CellError> {
-        let runtime = Runtime::new()
-            .map_err(|e| CellError::Database(format!("failed to create tokio runtime: {e}")))?;
-
         let agent = Agent::builder()
             .with_url(url)
             .build()
-            .map_err(|e| CellError::Database(format!("failed to build ic-agent: {e}")))?;
+            .map_err(|e| CellError::Transport(format!("failed to build ic-agent: {e}")))?;
 
-        if fetch_root_key {
-            runtime
-                .block_on(agent.fetch_root_key())
-                .map_err(|e| CellError::Database(format!("fetch_root_key failed: {e}")))?;
-        }
+        Self::init_with_agent(agent, canister_id, fetch_root_key)
+    }
 
-        Ok(Self {
-            agent,
-            canister_id,
-            runtime,
-        })
+    /// Connects to an IC replica with an authenticated `Identity` (required for
+    /// canisters enforcing `authorize_caller()`).
+    pub fn connect_with_identity<I: Identity + 'static>(
+        url: &str,
+        canister_id: Principal,
+        identity: I,
+        fetch_root_key: bool,
+    ) -> Result<Self, CellError> {
+        let agent = Agent::builder()
+            .with_url(url)
+            .with_identity(identity)
+            .build()
+            .map_err(|e| CellError::Transport(format!("failed to build ic-agent: {e}")))?;
+
+        Self::init_with_agent(agent, canister_id, fetch_root_key)
     }
 
     pub fn from_agent(agent: Agent, canister_id: Principal) -> Result<Self, CellError> {
-        let runtime = Runtime::new()
-            .map_err(|e| CellError::Database(format!("failed to create tokio runtime: {e}")))?;
-        Ok(Self {
+        Self::init_with_agent(agent, canister_id, false)
+    }
+
+    fn init_with_agent(
+        agent: Agent,
+        canister_id: Principal,
+        fetch_root_key: bool,
+    ) -> Result<Self, CellError> {
+        let runtime = if Handle::try_current().is_ok() {
+            None
+        } else {
+            Some(
+                Runtime::new().map_err(|e| {
+                    CellError::Transport(format!("failed to create tokio runtime: {e}"))
+                })?,
+            )
+        };
+
+        let transport = Self {
             agent,
             canister_id,
             runtime,
-        })
+        };
+
+        if fetch_root_key {
+            transport
+                .block_on(transport.agent.fetch_root_key())
+                .map_err(|e| CellError::Transport(format!("fetch_root_key failed: {e}")))?;
+        }
+
+        Ok(transport)
+    }
+
+    /// Runs an async future safely whether called from outside Tokio or inside a
+    /// multi-threaded Tokio runtime.
+    fn block_on<F: Future>(&self, fut: F) -> F::Output {
+        if let Ok(handle) = Handle::try_current() {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        } else if let Some(rt) = &self.runtime {
+            rt.block_on(fut)
+        } else {
+            let rt = Runtime::new().expect("tokio runtime creation failed");
+            rt.block_on(fut)
+        }
     }
 
     fn call_update<R>(&self, method: &str, args: Vec<u8>) -> Result<R, CellError>
@@ -59,17 +101,16 @@ impl IcAgentTransport {
         R: CandidType + DeserializeOwned,
     {
         let raw = self
-            .runtime
             .block_on(
                 self.agent
                     .update(&self.canister_id, method)
                     .with_arg(args)
                     .call_and_wait(),
             )
-            .map_err(|e| CellError::Database(format!("ic-agent update '{method}' failed: {e}")))?;
+            .map_err(|e| CellError::Transport(format!("ic-agent update '{method}' failed: {e}")))?;
 
         decode_one::<Result<R, CellError>>(&raw)
-            .map_err(|e| CellError::Database(format!("candid decode '{method}' failed: {e}")))?
+            .map_err(|e| CellError::Transport(format!("candid decode '{method}' failed: {e}")))?
     }
 
     fn call_query<R>(&self, method: &str, args: Vec<u8>) -> Result<R, CellError>
@@ -77,17 +118,16 @@ impl IcAgentTransport {
         R: CandidType + DeserializeOwned,
     {
         let raw = self
-            .runtime
             .block_on(
                 self.agent
                     .query(&self.canister_id, method)
                     .with_arg(args)
                     .call(),
             )
-            .map_err(|e| CellError::Database(format!("ic-agent query '{method}' failed: {e}")))?;
+            .map_err(|e| CellError::Transport(format!("ic-agent query '{method}' failed: {e}")))?;
 
         decode_one::<Result<R, CellError>>(&raw)
-            .map_err(|e| CellError::Database(format!("candid decode '{method}' failed: {e}")))?
+            .map_err(|e| CellError::Transport(format!("candid decode '{method}' failed: {e}")))?
     }
 }
 
@@ -228,7 +268,6 @@ impl IcCellTransport for IcAgentTransport {
 
     fn get_replication_state(&self) -> Result<ReplicationState, CellError> {
         let raw = self
-            .runtime
             .block_on(
                 self.agent
                     .query(&self.canister_id, "get_replication_state")
@@ -236,10 +275,10 @@ impl IcCellTransport for IcAgentTransport {
                     .call(),
             )
             .map_err(|e| {
-                CellError::Database(format!("ic-agent query 'get_replication_state' failed: {e}"))
+                CellError::Transport(format!("ic-agent query 'get_replication_state' failed: {e}"))
             })?;
         decode_one::<ReplicationState>(&raw).map_err(|e| {
-            CellError::Database(format!("candid decode 'get_replication_state' failed: {e}"))
+            CellError::Transport(format!("candid decode 'get_replication_state' failed: {e}"))
         })
     }
 }

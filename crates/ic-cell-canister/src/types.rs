@@ -31,6 +31,7 @@ pub enum CellError {
         reason: String,
     },
     Unauthorized,
+    Transport(String),
     InvalidArgument(String),
     Database(String),
 }

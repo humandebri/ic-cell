@@ -159,9 +159,9 @@ impl<T: IcCellTransport> IcCellClient<T> {
             .sql_execute(sql.into(), args, idempotency_key, fencing)
     }
 
-    /// Executes a SQL write with an idempotency key, retrying transient
-    /// transport/database errors up to `max_retries` times without risking
-    /// duplicate application (ADR-0002).
+    /// Executes a SQL write with an idempotency key, retrying only transient
+    /// `CellError::Transport` errors with exponential backoff (ADR-0002).
+    /// Non-retryable SQL / CAS / fencing errors are returned immediately.
     pub fn execute_idempotent_with_retry(
         &self,
         sql: impl Into<String>,
@@ -169,6 +169,7 @@ impl<T: IcCellTransport> IcCellClient<T> {
         idempotency_key: impl Into<String>,
         fencing: Option<FencingToken>,
         max_retries: usize,
+        base_backoff: std::time::Duration,
     ) -> Result<ExecResult, CellError> {
         let sql = sql.into();
         let key = idempotency_key.into();
@@ -181,7 +182,11 @@ impl<T: IcCellTransport> IcCellClient<T> {
                 fencing.clone(),
             ) {
                 Ok(res) => return Ok(res),
-                Err(CellError::Database(_)) if attempt < max_retries => {
+                Err(CellError::Transport(_)) if attempt < max_retries => {
+                    let delay = base_backoff.saturating_mul(1u32 << attempt.min(10));
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
                     attempt += 1;
                 }
                 Err(err) => return Err(err),
