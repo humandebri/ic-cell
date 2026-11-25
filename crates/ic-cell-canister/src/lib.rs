@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod ownership;
 pub mod replication;
 pub mod storage;
@@ -6,14 +7,15 @@ pub mod types;
 use candid::Principal;
 use ic_sqlite_vfs::{Db, DefaultMemoryImpl, Memory, MemoryId, MemoryManager};
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use types::{
-    CellError, ExecResult, LeaseRecord, LtxDeltaRequest, ObjectMeta, ObjectRecord, QueryResult,
-    ReplicationState, SqlValue,
+    CellError, ExecResult, InitArgs, LeaseRecord, LtxDeltaRequest, ObjectMeta, ObjectRecord,
+    PageDelta, QueryResult, ReplicationState, SqlValue, MAX_REPLY_PAYLOAD_BYTES,
 };
 
 const SQLITE_MEMORY_ID: MemoryId = MemoryId::new(120);
 const REPLICATION_META_MEMORY_ID: MemoryId = MemoryId::new(121);
+const AUTH_MEMORY_ID: MemoryId = MemoryId::new(122);
+const WASM_PAGE_SIZE: u64 = 65_536;
 
 thread_local! {
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
@@ -21,7 +23,6 @@ thread_local! {
             MemoryManager::init_strict(DefaultMemoryImpl::default())
                 .expect("stable memory must either be empty or use MemoryManager layout"),
         );
-    static AUTHORIZED_CALLERS: RefCell<BTreeSet<Principal>> = const { RefCell::new(BTreeSet::new()) };
 }
 
 fn init_db() {
@@ -30,38 +31,71 @@ fn init_db() {
     });
 }
 
-fn save_replication_meta() {
-    let encoded = replication::encode_state();
+fn write_region(id: MemoryId, bytes: &[u8]) {
     MEMORY_MANAGER.with(|manager| {
-        let mem = manager.borrow().get(REPLICATION_META_MEMORY_ID);
-        if mem.size() == 0 {
-            mem.grow(1);
+        let mem = manager.borrow().get(id);
+        let needed = (bytes.len() as u64).div_ceil(WASM_PAGE_SIZE).max(1);
+        if mem.size() < needed {
+            let grown = mem.grow(needed - mem.size());
+            if grown < 0 {
+                ic_cdk::trap("failed to grow stable memory region");
+            }
         }
-        mem.write(0, &encoded);
+        mem.write(0, bytes);
     });
 }
 
-fn load_replication_meta() {
+fn read_region(id: MemoryId, len: usize) -> Option<Vec<u8>> {
     MEMORY_MANAGER.with(|manager| {
-        let mem = manager.borrow().get(REPLICATION_META_MEMORY_ID);
-        if mem.size() > 0 {
-            let mut buf = [0u8; 32];
-            mem.read(0, &mut buf);
-            replication::decode_and_restore_state(&buf);
+        let mem = manager.borrow().get(id);
+        if mem.size() == 0 {
+            return None;
         }
-    });
+        let len = len.min((mem.size() * WASM_PAGE_SIZE) as usize);
+        let mut buf = vec![0u8; len];
+        mem.read(0, &mut buf);
+        Some(buf)
+    })
+}
+
+fn save_replication_meta() {
+    write_region(REPLICATION_META_MEMORY_ID, &replication::encode_state());
+}
+
+fn load_replication_meta() {
+    if let Some(buf) = read_region(REPLICATION_META_MEMORY_ID, replication::ENCODED_STATE_LEN) {
+        replication::decode_and_restore_state(&buf);
+    }
+}
+
+fn save_allowlist() {
+    write_region(AUTH_MEMORY_ID, &auth::encode());
+}
+
+fn load_allowlist() {
+    if let Some(buf) = read_region(AUTH_MEMORY_ID, auth::max_encoded_len()) {
+        auth::decode_and_restore(&buf);
+    }
+}
+
+fn apply_init_args(args: Option<InitArgs>) {
+    let callers = args.and_then(|a| a.authorized_callers).unwrap_or_default();
+    for principal in callers {
+        auth::insert(principal).unwrap_or_else(|e| ic_cdk::trap(&e));
+    }
 }
 
 fn authorize_caller() -> Result<(), CellError> {
     let caller = ic_cdk::api::msg_caller();
-    if ic_cdk::api::is_controller(&caller) {
-        return Ok(());
+    if ic_cdk::api::is_controller(&caller) || auth::contains(&caller) {
+        Ok(())
+    } else {
+        Err(CellError::Unauthorized)
     }
-    let allowed = AUTHORIZED_CALLERS.with(|set| {
-        let set = set.borrow();
-        set.is_empty() || set.contains(&caller)
-    });
-    if allowed {
+}
+
+fn authorize_controller() -> Result<(), CellError> {
+    if ic_cdk::api::is_controller(&ic_cdk::api::msg_caller()) {
         Ok(())
     } else {
         Err(CellError::Unauthorized)
@@ -73,10 +107,13 @@ fn now_ns() -> u64 {
 }
 
 #[ic_cdk::init]
-fn init() {
-    AUTHORIZED_CALLERS.with(|set| {
-        set.borrow_mut().insert(ic_cdk::api::msg_caller());
-    });
+fn init(args: Option<InitArgs>) {
+    let installer = ic_cdk::api::msg_caller();
+    if installer != Principal::anonymous() {
+        auth::insert(installer).unwrap_or_else(|e| ic_cdk::trap(&e));
+    }
+    apply_init_args(args);
+    save_allowlist();
     init_db();
     Db::migrate(storage::MIGRATIONS).expect("Db::migrate failed");
 }
@@ -84,13 +121,39 @@ fn init() {
 #[ic_cdk::pre_upgrade]
 fn pre_upgrade() {
     save_replication_meta();
+    save_allowlist();
 }
 
 #[ic_cdk::post_upgrade]
-fn post_upgrade() {
+fn post_upgrade(args: Option<InitArgs>) {
     init_db();
     Db::migrate(storage::MIGRATIONS).expect("Db::migrate failed");
     load_replication_meta();
+    load_allowlist();
+    apply_init_args(args);
+    save_allowlist();
+}
+
+#[ic_cdk::update]
+pub fn add_authorized_caller(principal: Principal) -> Result<bool, CellError> {
+    authorize_controller()?;
+    let inserted = auth::insert(principal).map_err(CellError::InvalidArgument)?;
+    save_allowlist();
+    Ok(inserted)
+}
+
+#[ic_cdk::update]
+pub fn remove_authorized_caller(principal: Principal) -> Result<bool, CellError> {
+    authorize_controller()?;
+    let removed = auth::remove(&principal);
+    save_allowlist();
+    Ok(removed)
+}
+
+#[ic_cdk::query]
+pub fn list_authorized_callers() -> Result<Vec<Principal>, CellError> {
+    authorize_caller()?;
+    Ok(auth::list())
 }
 
 #[ic_cdk::update]
@@ -129,12 +192,26 @@ pub fn put_object(
 #[ic_cdk::update]
 pub fn get_object_strong(key: String) -> Result<Option<ObjectRecord>, CellError> {
     authorize_caller()?;
-    storage::get_object(&key, true)
+    fit_reply(storage::get_object(&key, true)?)
+}
+
+/// Rejects whole-object reads that would exceed the IC reply limit (which
+/// would otherwise trap) and points callers at the ranged API.
+fn fit_reply(record: Option<ObjectRecord>) -> Result<Option<ObjectRecord>, CellError> {
+    match record {
+        Some(r) if r.value.len() as u64 > MAX_REPLY_PAYLOAD_BYTES => Err(CellError::InvalidArgument(format!(
+            "object {} is {} bytes, above the {MAX_REPLY_PAYLOAD_BYTES}-byte reply limit; use get_object_range_strong",
+            r.key,
+            r.value.len()
+        ))),
+        other => Ok(other),
+    }
 }
 
 #[ic_cdk::query]
 pub fn get_object_eventual(key: String) -> Result<Option<ObjectRecord>, CellError> {
-    storage::get_object(&key, false)
+    authorize_caller()?;
+    fit_reply(storage::get_object(&key, false)?)
 }
 
 #[ic_cdk::update]
@@ -166,6 +243,7 @@ pub fn sql_query_strong(sql: String, args: Vec<SqlValue>) -> Result<QueryResult,
 
 #[ic_cdk::query]
 pub fn sql_query_eventual(sql: String, args: Vec<SqlValue>) -> Result<QueryResult, CellError> {
+    authorize_caller()?;
     storage::query_sql(sql, args, false)
 }
 
@@ -194,6 +272,11 @@ pub fn get_object_range_strong(
     length: u64,
 ) -> Result<Vec<u8>, CellError> {
     authorize_caller()?;
+    if length > MAX_REPLY_PAYLOAD_BYTES {
+        return Err(CellError::InvalidArgument(format!(
+            "range length {length} exceeds the {MAX_REPLY_PAYLOAD_BYTES}-byte reply limit"
+        )));
+    }
     storage::get_object_range(&key, offset, length, true)
 }
 
@@ -219,9 +302,12 @@ pub fn commit_chunked_object(
     key: String,
     expected_generation: u64,
     fencing: Option<(String, String, u64)>,
-) -> Result<ObjectRecord, CellError> {
+) -> Result<ObjectMeta, CellError> {
     authorize_caller()?;
+    // Return metadata only: echoing the assembled value could exceed the
+    // reply limit for exactly the objects that needed chunking.
     storage::commit_chunked_object(upload_id, key, expected_generation, now_ns(), fencing)
+        .map(|r| ObjectMeta::from(&r))
 }
 
 #[ic_cdk::update]
@@ -232,6 +318,30 @@ pub fn apply_ltx_delta(req: LtxDeltaRequest) -> Result<ReplicationState, CellErr
     Ok(state)
 }
 
+#[ic_cdk::update]
+pub fn stage_ltx_pages(upload_id: String, pages: Vec<PageDelta>) -> Result<u64, CellError> {
+    authorize_caller()?;
+    replication::stage_ltx_pages(upload_id, pages)
+}
+
+#[ic_cdk::update]
+pub fn commit_staged_ltx_delta(
+    upload_id: String,
+    req: LtxDeltaRequest,
+) -> Result<ReplicationState, CellError> {
+    authorize_caller()?;
+    let state = replication::commit_staged_ltx_delta(&upload_id, req)?;
+    save_replication_meta();
+    Ok(state)
+}
+
+#[ic_cdk::update]
+pub fn abort_staged_ltx(upload_id: String) -> Result<u64, CellError> {
+    authorize_caller()?;
+    Ok(replication::abort_staged_ltx(&upload_id))
+}
+
+/// Replication progress metadata (no user data); intentionally public.
 #[ic_cdk::query]
 pub fn get_replication_state() -> ReplicationState {
     replication::get_replication_state()
@@ -262,6 +372,16 @@ mod tests {
         Db::init(manager.get(SQLITE_MEMORY_ID)).expect("Db::init failed");
         Db::migrate(storage::MIGRATIONS).expect("Db::migrate failed");
         TestDbGuard
+    }
+
+    #[test]
+    fn did_file_matches_exported_interface() {
+        use candid_parser::utils::{service_equal, CandidSource};
+        let exported = __export_service();
+        let did = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ic_cell_canister.did");
+        service_equal(CandidSource::Text(&exported), CandidSource::File(&did)).unwrap_or_else(
+            |e| panic!("ic_cell_canister.did is out of date: {e}\n--- exported ---\n{exported}"),
+        );
     }
 
     #[test]

@@ -35,3 +35,12 @@
 ### Negative
 - S3 と比較して 1 リクエストあたりのレイテンシとストレージ単価（Stable Memory / Cycles）が高いため、ホットキャッシュやコンパクション戦略のチューニングが必要になる。
 - チャンク分割アップロードの途中失敗による孤立チャンクの GC（ガベージコレクション）機構が必要になる。
+
+## Implementation Notes (2026-11-25)
+
+- `ic_cell_client::object_store_adapter::IcObjectStoreAdapter` が `object_store` 0.14 の `ObjectStore` トレイトを実装する（feature `object-store`、デフォルト有効）。
+- ETag / version は Canister の generation。`PutMode::Create` / `Update` は条件付き作成 / CAS、`Overwrite` は現在 generation に対する CAS ループ。
+- 読み取りは strong（update call）で、1 MiB 単位の Range Read に分割し、読み取り中に generation が変わった場合は再試行する（異なる世代のバイトが混ざらない）。
+- マルチパートは各パートを Canister チャンクとして送り、`complete` で CAS コミットする。CAS 失敗時もチャンクは保持されるため再コミットできる。
+- IC の応答上限（2 MiB）対策として、`commit_chunked_object` は値を含まない `ObjectMeta` を返し、`get_object_*` は 2,000,000 byte を超えるオブジェクトに対してトラップではなく `InvalidArgument` を返す（`get_object_range_strong` を使う）。
+- 属性（attributes）とタグは保存しない。

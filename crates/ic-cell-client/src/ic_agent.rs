@@ -2,7 +2,7 @@
 
 use crate::{
     CellError, Consistency, ExecResult, FencingToken, IcCellTransport, LeaseRecord,
-    LtxDeltaRequest, ObjectMeta, ObjectRecord, QueryResult, ReplicationState, SqlValue,
+    LtxDeltaRequest, ObjectMeta, ObjectRecord, PageDelta, QueryResult, ReplicationState, SqlValue,
 };
 use candid::{decode_one, encode_args, CandidType, Principal};
 use ic_agent::{Agent, Identity};
@@ -61,11 +61,9 @@ impl IcAgentTransport {
         let runtime = if Handle::try_current().is_ok() {
             None
         } else {
-            Some(
-                Runtime::new().map_err(|e| {
-                    CellError::Transport(format!("failed to create tokio runtime: {e}"))
-                })?,
-            )
+            Some(Runtime::new().map_err(|e| {
+                CellError::Transport(format!("failed to create tokio runtime: {e}"))
+            })?)
         };
 
         let transport = Self {
@@ -128,6 +126,30 @@ impl IcAgentTransport {
 
         decode_one::<Result<R, CellError>>(&raw)
             .map_err(|e| CellError::Transport(format!("candid decode '{method}' failed: {e}")))?
+    }
+}
+
+impl IcAgentTransport {
+    /// Controller-only: allows `principal` to call the canister.
+    pub fn add_authorized_caller(&self, principal: Principal) -> Result<bool, CellError> {
+        self.call_update("add_authorized_caller", enc((principal,))?)
+    }
+
+    /// Controller-only: revokes `principal`.
+    pub fn remove_authorized_caller(&self, principal: Principal) -> Result<bool, CellError> {
+        self.call_update("remove_authorized_caller", enc((principal,))?)
+    }
+
+    pub fn list_authorized_callers(&self) -> Result<Vec<Principal>, CellError> {
+        self.call_query("list_authorized_callers", enc(())?)
+    }
+
+    pub fn agent(&self) -> &Agent {
+        &self.agent
+    }
+
+    pub fn canister_id(&self) -> Principal {
+        self.canister_id
     }
 }
 
@@ -231,7 +253,7 @@ impl IcCellTransport for IcAgentTransport {
         key: String,
         expected_generation: u64,
         fencing: Option<FencingToken>,
-    ) -> Result<ObjectRecord, CellError> {
+    ) -> Result<ObjectMeta, CellError> {
         let f = fencing.map(|t| t.as_tuple());
         self.call_update(
             "commit_chunked_object",
@@ -275,10 +297,32 @@ impl IcCellTransport for IcAgentTransport {
                     .call(),
             )
             .map_err(|e| {
-                CellError::Transport(format!("ic-agent query 'get_replication_state' failed: {e}"))
+                CellError::Transport(format!(
+                    "ic-agent query 'get_replication_state' failed: {e}"
+                ))
             })?;
         decode_one::<ReplicationState>(&raw).map_err(|e| {
             CellError::Transport(format!("candid decode 'get_replication_state' failed: {e}"))
         })
+    }
+
+    fn stage_ltx_pages(&self, upload_id: String, pages: Vec<PageDelta>) -> Result<u64, CellError> {
+        self.call_update("stage_ltx_pages", enc((upload_id, pages))?)
+    }
+
+    fn commit_staged_ltx_delta(
+        &self,
+        upload_id: String,
+        req: LtxDeltaRequest,
+    ) -> Result<ReplicationState, CellError> {
+        self.call_update("commit_staged_ltx_delta", enc((upload_id, req))?)
+    }
+
+    fn abort_staged_ltx(&self, upload_id: String) -> Result<u64, CellError> {
+        self.call_update("abort_staged_ltx", enc((upload_id,))?)
+    }
+
+    fn abort_chunked_upload(&self, upload_id: &str) -> Result<u64, CellError> {
+        self.call_update("abort_chunked_upload", enc((upload_id,))?)
     }
 }

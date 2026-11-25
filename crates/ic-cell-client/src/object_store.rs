@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Default chunk size (1 MiB) safely below the ICP 2 MiB ingress message limit.
 pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 
+static GLOBAL_UPLOAD_SEQ: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PutMode {
     Create,
@@ -57,16 +59,29 @@ impl<'a, T: IcCellTransport> IcObjectStore<'a, T> {
                 .put_object(key, value, expected_generation, fencing);
         }
 
+        // Unique across adapter instances and processes so concurrent uploads
+        // of the same key never share staging chunks.
         let seq = self.upload_seq.fetch_add(1, Ordering::SeqCst);
-        let upload_id = format!("upload-{seq}-{key}");
+        let global = GLOBAL_UPLOAD_SEQ.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let upload_id = format!("upload-{}-{nanos}-{global}-{seq}-{key}", std::process::id());
 
         for (idx, chunk) in value.chunks(self.chunk_size).enumerate() {
             self.transport
                 .put_object_chunk(upload_id.clone(), idx as u32, chunk.to_vec())?;
         }
 
-        self.transport
-            .commit_chunked_object(upload_id, key, expected_generation, fencing)
+        let meta =
+            self.transport
+                .commit_chunked_object(upload_id, key, expected_generation, fencing)?;
+        Ok(ObjectRecord {
+            key: meta.key,
+            value,
+            generation: meta.generation,
+            updated_at_ns: meta.updated_at_ns,
+        })
     }
 
     pub fn get(&self, key: &str) -> Result<Option<ObjectRecord>, CellError> {

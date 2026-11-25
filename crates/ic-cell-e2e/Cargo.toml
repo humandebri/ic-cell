@@ -1,0 +1,21 @@
+[package]
+name = "ic-cell-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "PocketIC end-to-end tests for the real ic-cell-canister wasm"
+
+[dev-dependencies]
+candid.workspace = true
+ic-agent = "0.40"
+ic-cell-canister = { path = "../ic-cell-canister" }
+ic-cell-client = { path = "../ic-cell-client" }
+ic-sqlite-vfs = { git = "https://github.com/humandebri/ic-sqlite-vfs.git", rev = "acdc6b0", default-features = false, features = ["sqlite-bundled"] }
+ed25519-consensus = "2"
+futures = "0.3"
+object_store = { version = "0.14", default-features = false }
+pocket-ic = "=11.0.0"
+serial_test = "3"
+serde.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }

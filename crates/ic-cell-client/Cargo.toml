@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["ic-agent"]
+default = ["ic-agent", "object-store"]
 ic-agent = ["dep:ic-agent", "dep:tokio"]
+object-store = ["dep:object_store", "dep:async-trait", "dep:bytes", "dep:futures", "dep:tokio", "dep:chrono"]
 
 [dependencies]
 candid.workspace = true
@@ -14,8 +15,16 @@ ic-agent = { version = "0.40", optional = true }
 ic-cell-canister = { path = "../ic-cell-canister" }
 serde.workspace = true
 thiserror.workspace = true
+crc = "3"
+lz4_flex = "0.11"
+object_store = { version = "0.14", optional = true, default-features = false }
+async-trait = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+futures = { version = "0.3", optional = true }
+chrono = { version = "0.4", optional = true, default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 
 [dev-dependencies]
 ic-sqlite-vfs = { git = "https://github.com/humandebri/ic-sqlite-vfs.git", rev = "acdc6b0", default-features = false, features = ["sqlite-bundled"] }
 serial_test = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

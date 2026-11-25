@@ -3,7 +3,8 @@
     "ic_cell_canister": {
       "type": "rust",
       "package": "ic-cell-canister",
-      "candid": "crates/ic-cell-canister/ic_cell_canister.did"
+      "candid": "crates/ic-cell-canister/ic_cell_canister.did",
+      "gzip": true
     }
   },
   "defaults": {
