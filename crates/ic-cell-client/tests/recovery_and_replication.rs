@@ -76,6 +76,8 @@ fn phase5_ltx_page_delta_replication_and_sql_query_on_mirror() {
             commit_pages: page_count,
             pre_apply_checksum: 0,
             post_apply_checksum: expected_checksum,
+            ltx_pre_apply_checksum: None,
+            ltx_post_apply_checksum: None,
             pages,
         })
         .unwrap();
@@ -107,6 +109,8 @@ fn phase5_ltx_page_delta_replication_and_sql_query_on_mirror() {
             commit_pages: page_count,
             pre_apply_checksum: expected_checksum,
             post_apply_checksum: 0,
+            ltx_pre_apply_checksum: None,
+            ltx_post_apply_checksum: None,
             pages: vec![],
         })
         .unwrap_err();
@@ -123,7 +127,12 @@ fn phase6_object_store_chunked_upload_range_read_and_list() {
 
     let payload = b"0123456789abcdefghijklmnopqrstuvwxyz".to_vec();
     let rec = store
-        .put("ltx/cell-1/0001.ltx", payload.clone(), PutMode::Create, None)
+        .put(
+            "ltx/cell-1/0001.ltx",
+            payload.clone(),
+            PutMode::Create,
+            None,
+        )
         .unwrap();
     assert_eq!(rec.generation, 1);
     assert_eq!(rec.value, payload);
@@ -139,7 +148,12 @@ fn phase6_object_store_chunked_upload_range_read_and_list() {
 
     // Prefix list
     store
-        .put("ltx/cell-1/0002.ltx", b"delta2".to_vec(), PutMode::Create, None)
+        .put(
+            "ltx/cell-1/0002.ltx",
+            b"delta2".to_vec(),
+            PutMode::Create,
+            None,
+        )
         .unwrap();
     store
         .put("other/key", b"x".to_vec(), PutMode::Create, None)

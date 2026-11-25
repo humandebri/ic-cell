@@ -45,3 +45,10 @@
 ### Negative
 - `ic-sqlite-vfs` の内部レイアウトや overlay 機構への依存が発生するため、上流との協調または拡張 PR が必要になる。
 - 1 回の LTX が ICP の Ingress メッセージ上限（2 MiB 等）を超える場合、チャンク分割アップロードとステージング領域が必要になる。
+
+## Implementation Notes (2026-11-25)
+
+- **LTX ファイルのデコード**: `ic_cell_client::ltx_codec` が `superfly/ltx` 形式（magic `LTX1`、ヘッダ 100 byte、6 byte ページヘッダ + サイズ付き LZ4 ブロック、ページインデックス、16 byte トレーラ）をバイト互換でデコード / エンコードする。ファイルチェックサム（CRC-64/ISO、圧縮前ページで計算）・ページ順序・インデックス・スナップショットの DB チェックサムをすべて検証してから Canister に送る。
+- **2 系統のチェックサム**: `pre/post_apply_checksum` は従来どおり `ic-sqlite-vfs` イメージのチェックサム（0 = スキップ）。LTX 形式のチェックサムは `ltx_pre/post_apply_checksum : opt nat64` として別フィールドで渡し、Canister は `ltx.ChecksumPage`（`FLAG | CRC64(be32(pgno) || page)` の XOR、lock page 除外）と同じ定義で **書き込み前に** 増分計算・検証する。不一致なら何も変更せずに拒否する。計算結果は `ReplicationState.ltx_checksum` として Stable Memory に永続化される。
+- **スナップショット**（`min_txid == 1`）は `1..=commit`（lock page を除く）の全ページを含む必要があり、`max_txid >= last_txid` であれば既存ミラーをリセットできる。
+- **大きな差分のステージング**: 1 メッセージに収まらない差分は `stage_ltx_pages` → `commit_staged_ltx_delta` で分割送信し、コミットは 1 メッセージでアトミックに適用する。ステージング領域はヒープ上（1 アップロード 128 MiB / 合計 256 MiB / 同時 16 件まで）で、アップグレードを跨がない。`LtxReplicationAdapter` が自動で使い分ける。

@@ -42,6 +42,8 @@ impl std::fmt::Display for CellError {
     }
 }
 
+impl std::error::Error for CellError {}
+
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ObjectRecord {
     pub key: String,
@@ -57,6 +59,21 @@ pub struct ObjectMeta {
     pub generation: u64,
     pub updated_at_ns: u64,
 }
+
+impl From<&ObjectRecord> for ObjectMeta {
+    fn from(r: &ObjectRecord) -> Self {
+        Self {
+            key: r.key.clone(),
+            size: r.value.len() as u64,
+            generation: r.generation,
+            updated_at_ns: r.updated_at_ns,
+        }
+    }
+}
+
+/// Largest payload returned in a single reply. The IC caps replies at 2 MiB;
+/// keep headroom for Candid framing.
+pub const MAX_REPLY_PAYLOAD_BYTES: u64 = 2_000_000;
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct LeaseRecord {
@@ -102,6 +119,12 @@ pub struct LtxDeltaRequest {
     pub pre_apply_checksum: u64,
     pub post_apply_checksum: u64,
     pub pages: Vec<PageDelta>,
+    /// LTX-format database checksum before this delta (`None` = skip check).
+    #[serde(default)]
+    pub ltx_pre_apply_checksum: Option<u64>,
+    /// LTX-format database checksum after this delta (`None` = skip check).
+    #[serde(default)]
+    pub ltx_post_apply_checksum: Option<u64>,
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -110,4 +133,12 @@ pub struct ReplicationState {
     pub last_txid: u64,
     pub last_checksum: u64,
     pub page_count: u32,
+    /// LTX-format checksum of the mirrored database (`0` = not tracked yet).
+    pub ltx_checksum: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct InitArgs {
+    /// Principals (besides controllers) allowed to call the canister.
+    pub authorized_callers: Option<Vec<candid::Principal>>,
 }

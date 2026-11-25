@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ic-cell-canister",
     "crates/ic-cell-client",
+    "crates/ic-cell-e2e",
 ]
 
 [workspace.package]

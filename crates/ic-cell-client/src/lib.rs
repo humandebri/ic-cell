@@ -2,7 +2,10 @@
 pub mod ic_agent;
 pub mod in_process;
 pub mod ltx;
+pub mod ltx_codec;
 pub mod object_store;
+#[cfg(feature = "object-store")]
+pub mod object_store_adapter;
 
 pub use ic_cell_canister::types::{
     CellError, ExecResult, LeaseRecord, LtxDeltaRequest, ObjectMeta, ObjectRecord, PageDelta,
@@ -98,7 +101,7 @@ pub trait IcCellTransport {
         key: String,
         expected_generation: u64,
         fencing: Option<FencingToken>,
-    ) -> Result<ObjectRecord, CellError>;
+    ) -> Result<ObjectMeta, CellError>;
 
     fn sql_execute(
         &self,
@@ -118,6 +121,21 @@ pub trait IcCellTransport {
     fn apply_ltx_delta(&self, req: LtxDeltaRequest) -> Result<ReplicationState, CellError>;
 
     fn get_replication_state(&self) -> Result<ReplicationState, CellError>;
+
+    /// Stages pages of a delta too large for one ingress message.
+    fn stage_ltx_pages(&self, upload_id: String, pages: Vec<PageDelta>) -> Result<u64, CellError>;
+
+    /// Atomically applies staged pages plus `req.pages`.
+    fn commit_staged_ltx_delta(
+        &self,
+        upload_id: String,
+        req: LtxDeltaRequest,
+    ) -> Result<ReplicationState, CellError>;
+
+    fn abort_staged_ltx(&self, upload_id: String) -> Result<u64, CellError>;
+
+    /// Discards chunks of an uncommitted chunked object upload.
+    fn abort_chunked_upload(&self, upload_id: &str) -> Result<u64, CellError>;
 }
 
 pub struct IcCellClient<T: IcCellTransport> {

@@ -17,6 +17,30 @@ jobs:
         run: cargo test --workspace -- --test-threads=1
       - name: Check wasm32 canister build
         run: cargo check -p ic-cell-canister --target wasm32-unknown-unknown
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  e2e:
+    runs-on: ubuntu-latest
+    env:
+      POCKET_IC_VERSION: "11.0.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Build canister wasm
+        run: cargo build -p ic-cell-canister --target wasm32-unknown-unknown --release
+      - name: Install PocketIC server
+        run: |
+          curl -sSfL "https://github.com/dfinity/pocketic/releases/download/${POCKET_IC_VERSION}/pocket-ic-x86_64-linux.gz" -o pocket-ic.gz
+          gunzip pocket-ic.gz
+          chmod +x pocket-ic
+          echo "POCKET_IC_BIN=$PWD/pocket-ic" >> "$GITHUB_ENV"
+      - name: PocketIC end-to-end tests
+        env:
+          IC_CELL_E2E_REQUIRED: "1"
+        run: cargo test -p ic-cell-e2e -- --test-threads=1
 
   typescript:
     runs-on: ubuntu-latest

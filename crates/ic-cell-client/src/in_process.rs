@@ -1,6 +1,6 @@
 use crate::{
     CellError, Consistency, ExecResult, FencingToken, IcCellTransport, LeaseRecord,
-    LtxDeltaRequest, ObjectMeta, ObjectRecord, QueryResult, ReplicationState, SqlValue,
+    LtxDeltaRequest, ObjectMeta, ObjectRecord, PageDelta, QueryResult, ReplicationState, SqlValue,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -138,7 +138,7 @@ impl IcCellTransport for InProcessTransport {
         key: String,
         expected_generation: u64,
         fencing: Option<FencingToken>,
-    ) -> Result<ObjectRecord, CellError> {
+    ) -> Result<ObjectMeta, CellError> {
         ic_cell_canister::storage::commit_chunked_object(
             upload_id,
             key,
@@ -146,6 +146,7 @@ impl IcCellTransport for InProcessTransport {
             self.now_ns(),
             fencing.map(|f| f.as_tuple()),
         )
+        .map(|r| ObjectMeta::from(&r))
     }
 
     fn sql_execute(
@@ -179,5 +180,25 @@ impl IcCellTransport for InProcessTransport {
 
     fn get_replication_state(&self) -> Result<ReplicationState, CellError> {
         Ok(ic_cell_canister::replication::get_replication_state())
+    }
+
+    fn stage_ltx_pages(&self, upload_id: String, pages: Vec<PageDelta>) -> Result<u64, CellError> {
+        ic_cell_canister::replication::stage_ltx_pages(upload_id, pages)
+    }
+
+    fn commit_staged_ltx_delta(
+        &self,
+        upload_id: String,
+        req: LtxDeltaRequest,
+    ) -> Result<ReplicationState, CellError> {
+        ic_cell_canister::replication::commit_staged_ltx_delta(&upload_id, req)
+    }
+
+    fn abort_staged_ltx(&self, upload_id: String) -> Result<u64, CellError> {
+        Ok(ic_cell_canister::replication::abort_staged_ltx(&upload_id))
+    }
+
+    fn abort_chunked_upload(&self, upload_id: &str) -> Result<u64, CellError> {
+        ic_cell_canister::storage::abort_chunked_upload(upload_id)
     }
 }

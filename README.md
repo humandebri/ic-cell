@@ -80,28 +80,56 @@ export class Agent extends DurableObject {
 
 ---
 
-## リポジトリ構成（計画）
+## リポジトリ構成
 
 ```text
 ic-cell/
 ├── crates/
 │   ├── ic-cell-canister/     # ic-sqlite-vfs を使った状態管理・所有権・CAS Canister
-│   │   ├── src/
-│   │   │   ├── storage.rs
-│   │   │   ├── ownership.rs
-│   │   │   └── lib.rs
-│   └── ic-cell-client/       # Rust クライアント / LTX アダプタ
+│   │   └── src/
+│   │       ├── lib.rs          # Canister エントリポイント（認可・アップグレード）
+│   │       ├── auth.rs         # Stable Memory に永続化される許可リスト
+│   │       ├── storage.rs      # SQL / オブジェクト / チャンクアップロード
+│   │       ├── ownership.rs    # Lease・Fencing Epoch
+│   │       └── replication.rs  # LTX ページ差分適用・LTX チェックサム・ステージング
+│   ├── ic-cell-client/       # Rust クライアント
+│   │   └── src/
+│   │       ├── ic_agent.rs             # ic-agent トランスポート（+ 許可リスト管理）
+│   │       ├── ltx_codec.rs            # LTX ファイル（LTX1）のデコーダ / エンコーダ
+│   │       ├── ltx.rs                  # LTX レプリケーションアダプタ（自動ステージング）
+│   │       ├── object_store.rs         # 同期版オブジェクトストア
+│   │       └── object_store_adapter.rs # object_store::ObjectStore 実装
+│   └── ic-cell-e2e/          # PocketIC 上で実 wasm を使う E2E テスト
 ├── packages/
 │   └── typescript-sdk/       # Workers / Durable Objects 向け IC_DB バインディング
 ├── examples/
 │   ├── durable-counter/      # 最小構成サンプル
 │   └── immortal-agent/       # サーバーが消えても状態が残る AI Agent デモ
-├── tests/
-│   ├── concurrent-cas/       # 競合書き込み・CAS 検証
-│   ├── node-failover/        # ノード障害・フェイルオーバー検証
-│   └── recovery/             # 状態復元・整合性検証
 └── docs/
-    └── PLAN.md               # 詳細な実装計画・技術課題
+    ├── PLAN.md               # 詳細な実装計画・技術課題
+    └── adr/                  # Architecture Decision Records
+```
+
+## テスト
+
+```bash
+# ネイティブのユニット / 結合テスト（.did と実装の一致チェックを含む）
+cargo test --workspace -- --test-threads=1
+
+# PocketIC E2E（実 wasm のデプロイ・アップグレード・ic-agent 経由の LTX / object_store）
+cargo build -p ic-cell-canister --target wasm32-unknown-unknown --release
+cargo test -p ic-cell-e2e -- --test-threads=1
+```
+
+PocketIC サーバーは `POCKET_IC_BIN`、`dfx` 同梱のバイナリ（`~/.cache/dfinity/versions/*/pocket-ic`）の順に探し、見つからなければ自動ダウンロードされます。wasm が無い場合 E2E はスキップされます（CI では `IC_CELL_E2E_REQUIRED=1` で必須化）。
+
+## 認可
+
+コントローラは常に許可され、それ以外は許可リストに登録された principal のみが呼び出せます（詳細は [ADR-0005](./docs/adr/0005-caller-authorization.md)）。
+
+```bash
+dfx deploy ic_cell_canister --argument '(opt record { authorized_callers = opt vec { principal "<celld-node-principal>" } })'
+dfx canister call ic_cell_canister add_authorized_caller '(principal "<principal>")'
 ```
 
 ---

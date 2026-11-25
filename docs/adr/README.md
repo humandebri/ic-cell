@@ -10,6 +10,7 @@
 | [ADR-0002](./0002-consistency-and-concurrency-control.md) | ICP 上の CAS・Fencing Epoch および Query/Update の整合性モデル | Proposed |
 | [ADR-0003](./0003-ltx-replication-to-ic-sqlite-vfs.md) | LTX ページ差分の `ic-sqlite-vfs` への適用方針 | Proposed |
 | [ADR-0004](./0004-icp-object-storage-backend.md) | `celld` 向け ICP Object Storage Backend (`StorageBackend::Ic`) の設計 | Proposed |
+| [ADR-0005](./0005-caller-authorization.md) | 呼び出し元許可リストの永続化と管理 API | Accepted |
 
 ## ステータス定義
 
