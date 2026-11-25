@@ -19,6 +19,7 @@ import {
   IcCellError,
   LeaseHeldError,
   StaleEpochError,
+  isDeterministicRollbackError,
   isTransientError,
 } from "./errors.ts";
 import type { CellOp, CellTransport, FencingToken, OpResult, SqlParam } from "./types.ts";
@@ -281,12 +282,23 @@ export class CellStorage {
     if (this.inTransaction && extra.length > 0) {
       throw new IcCellError("INVALID_ARGUMENT", "storage.sql() is not allowed inside transaction()");
     }
-    const ops = [...this.pending, ...extra];
+    const priorPending = this.pending;
+    const ops = [...priorPending, ...extra];
     this.pending = [];
     if (ops.length === 0) return [];
-    const result = await this.cell.commit(ops);
-    this.cell.onCommitted();
-    return result.results;
+    try {
+      const result = await this.cell.commit(ops);
+      this.cell.onCommitted();
+      return result.results;
+    } catch (err) {
+      if (isDeterministicRollbackError(err)) {
+        // The canister rolled back the entire transaction; restore prior pending
+        // writes (excluding the failing `extra` op) so catching a SQL error does
+        // not discard earlier writes or poison the cell instance.
+        this.pending = priorPending;
+      }
+      throw err;
+    }
   }
 
   private async load(keys: string[]): Promise<void> {
@@ -301,8 +313,10 @@ export class CellStorage {
   }
 
   private async loadAll(): Promise<void> {
-    // Pending writes must be committed so the canister listing includes them.
-    await this.sync();
+    // Outside a transaction, commit pending writes first; inside a transaction,
+    // never commit mid-flight (local uncommitted writes/tombstones in `this.cache`
+    // take precedence over canister entries via `!this.cache.has(e.key)`).
+    if (!this.inTransaction) await this.sync();
     let startAfter: string | undefined;
     for (;;) {
       const page = await this.cell.transport.kvList(this.cell.id, { startAfter, limit: 1000 });
@@ -391,7 +405,14 @@ class ActiveCell {
       try {
         return await this.transport.transact(this.fencing, ops, key);
       } catch (err) {
-        if (attempt < max && isTransientError(err)) continue;
+        if (attempt < max && isTransientError(err)) {
+          await this.ns.sleep(Math.min(50 * 2 ** attempt, 1_000));
+          continue;
+        }
+        if (isDeterministicRollbackError(err)) {
+          // Canister rolled back cleanly; keep the cell instance alive.
+          throw err;
+        }
         // Local state may now diverge from the canister: discard the instance.
         this.ns.markBroken(this, err as Error);
         throw err;
@@ -469,6 +490,12 @@ export class CellNamespace<Env = unknown> {
     }
     this.touch(cell);
     return cell.enqueue(async () => {
+      // Re-verify lease validity at execution time so queued read-only calls
+      // cannot serve stale cached state after lease expiry.
+      if (this.timers.now() >= cell.validUntilMs) {
+        await this.renew(cell);
+        if (cell.broken) throw cell.broken;
+      }
       const fn = (cell.object as Record<string, unknown>)[method];
       if (
         typeof fn !== "function" ||
@@ -530,11 +557,10 @@ export class CellNamespace<Env = unknown> {
     for (const { cellId } of due) {
       try {
         const cell = await this.ensureActive(cellId);
-        await this.fireAlarm(cell);
-        fired++;
-      } catch (err) {
-        if (!(err instanceof LeaseHeldError)) throw err;
-        // A live owner fires it.
+        if (await this.fireAlarm(cell)) fired++;
+      } catch {
+        // Skip individual cell failures (e.g. LeaseHeldError or handler error)
+        // so remaining due alarms still run.
       }
     }
     return fired;
@@ -560,6 +586,9 @@ export class CellNamespace<Env = unknown> {
   async evict(id: string, release = true): Promise<void> {
     const cell = this.active.get(id);
     if (!cell) return;
+    // Detach immediately so concurrent calls activate a fresh instance instead
+    // of enqueuing onto an instance whose lease is about to be released.
+    this.active.delete(id);
     await cell.enqueue(async () => undefined).catch(() => undefined);
     this.drop(cell);
     if (release && !cell.broken) {
@@ -579,10 +608,12 @@ export class CellNamespace<Env = unknown> {
     return Array.from(this.active.keys());
   }
 
-  /** Runs an alarm now if one is set (also invoked by timers / the poller). */
-  async fireAlarm(cell: ActiveCell): Promise<void> {
+  /** Runs an alarm now if one is set (also invoked by timers / the poller).
+   * Returns `true` if the alarm ran and succeeded. */
+  async fireAlarm(cell: ActiveCell): Promise<boolean> {
     const due = cell.storage.alarmNs();
-    if (due === null) return;
+    if (due === null) return false;
+    let succeeded = false;
     await cell.enqueue(async () => {
       // The alarm may have been changed while waiting in the queue.
       if (cell.storage.alarmNs() !== due) return;
@@ -599,6 +630,7 @@ export class CellNamespace<Env = unknown> {
         if (cell.storage.alarmRevision() === revision) await cell.storage.deleteAlarm();
         await cell.storage.sync();
         cell.alarmRetries = 0;
+        succeeded = true;
       } catch (err) {
         await cell.storage.sync().catch(() => undefined);
         cell.alarmRetries++;
@@ -616,9 +648,18 @@ export class CellNamespace<Env = unknown> {
         cell.alarmTimer = this.timers.setTimeout(() => void this.fireAlarm(cell), backoff);
       }
     });
+    return succeeded;
   }
 
   // ---- internals ----
+
+  /** @internal */
+  sleep(ms: number): Promise<void> {
+    if (!this.autoTimers || ms <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.timers.setTimeout(resolve, ms);
+    });
+  }
 
   /** @internal */
   markBroken(cell: ActiveCell, err: Error): void {

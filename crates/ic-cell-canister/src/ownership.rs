@@ -46,7 +46,8 @@ pub fn acquire_or_renew_lease(
                 }))
             }
             Some((current_owner, current_epoch, current_expires_at)) => {
-                if current_owner == owner_id {
+                if !current_owner.is_empty() && current_owner == owner_id && now_ns < current_expires_at
+                {
                     conn.execute(
                         "UPDATE _ic_cell_leases
                          SET expires_at_ns = ?2
@@ -59,8 +60,12 @@ pub fn acquire_or_renew_lease(
                         epoch: current_epoch,
                         expires_at_ns,
                     }))
-                } else if now_ns >= current_expires_at {
-                    let next_epoch = current_epoch + 1;
+                } else if current_owner.is_empty() || now_ns >= current_expires_at {
+                    let next_epoch = if !current_owner.is_empty() && current_owner == owner_id {
+                        current_epoch
+                    } else {
+                        current_epoch + 1
+                    };
                     conn.execute(
                         "UPDATE _ic_cell_leases
                          SET owner_id = ?2, epoch = ?3, expires_at_ns = ?4
@@ -96,8 +101,10 @@ pub fn release_lease(cell_id: String, owner_id: String, epoch: u64) -> Result<()
         if let Err(err) = verify_fencing_epoch(conn, &cell_id, &owner_id, epoch)? {
             return Ok(Err(err));
         }
+        // Keep the row with owner_id='' and expires_at_ns=0 so epoch remains
+        // strictly monotonic on future acquisitions.
         conn.execute(
-            "DELETE FROM _ic_cell_leases WHERE cell_id = ?1",
+            "UPDATE _ic_cell_leases SET owner_id = '', expires_at_ns = 0 WHERE cell_id = ?1",
             params![cell_id],
         )?;
         Ok(Ok(()))
@@ -110,7 +117,7 @@ pub fn get_lease(cell_id: &str) -> Result<Option<LeaseRecord>, CellError> {
     Db::update(|conn| {
         conn.query_optional(
             "SELECT cell_id, owner_id, epoch, expires_at_ns
-             FROM _ic_cell_leases WHERE cell_id = ?1",
+             FROM _ic_cell_leases WHERE cell_id = ?1 AND owner_id != ''",
             params![cell_id],
             |row| {
                 Ok(LeaseRecord {

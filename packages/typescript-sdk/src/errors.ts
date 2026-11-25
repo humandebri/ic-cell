@@ -83,7 +83,32 @@ export class CellUnavailableError extends IcCellError {
 
 /** True for errors where retrying the same idempotent request is safe. */
 export function isTransientError(err: unknown): boolean {
-  return err instanceof IcCellError
-    ? err.code === "TRANSPORT" || err.code === "UNKNOWN_OUTCOME"
-    : !(err instanceof TypeError || err instanceof RangeError);
+  if (err instanceof IcCellError) {
+    return err.code === "TRANSPORT" || err.code === "UNKNOWN_OUTCOME";
+  }
+  if (err instanceof Error) {
+    // Reject deterministic JS errors and `@dfinity/agent` canister rejections
+    // (UpdateCallRejectedError / QueryCallRejectedError / IdentityInvalidError).
+    if (
+      err instanceof TypeError ||
+      err instanceof RangeError ||
+      err.name === "UpdateCallRejectedError" ||
+      err.name === "QueryCallRejectedError" ||
+      err.name === "IdentityInvalidError" ||
+      err.name === "CertificateVerificationError"
+    ) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+/** True for deterministic canister errors that rolled back cleanly on-chain
+ * without invalidating the cell's lease or local cache coherence. */
+export function isDeterministicRollbackError(err: unknown): boolean {
+  return (
+    err instanceof IcCellError &&
+    (err.code === "DATABASE" || err.code === "INVALID_ARGUMENT" || err.code === "PRECONDITION_FAILED")
+  );
 }
