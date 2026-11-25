@@ -1,15 +1,26 @@
 import {
   CasConflictError,
   IcCellError,
+  LeaseHeldError,
+  PreconditionFailedError,
   StaleEpochError,
-  type ExecOptions,
-  type ExecResult,
-  type FencingToken,
-  type IcDbTransport,
-  type LeaseRecord,
-  type QueryOptions,
-  type SqlParam,
-} from "./index.ts";
+} from "./errors.ts";
+import type {
+  Activation,
+  CellOp,
+  CellTransport,
+  DueAlarm,
+  ExecOptions,
+  ExecResult,
+  FencingToken,
+  IcDbTransport,
+  KvListOptions,
+  KvListResult,
+  LeaseRecord,
+  QueryOptions,
+  SqlParam,
+  TransactResult,
+} from "./types.ts";
 
 export type CandidSqlValue =
   | { Null: null }
@@ -45,6 +56,7 @@ export type CandidCellError =
   | { NotOwner: { cell_id: string } }
   | { ReplicationMismatch: { reason: string } }
   | { Unauthorized: null }
+  | { PreconditionFailed: { reason: string } }
   | { Transport: string }
   | { InvalidArgument: string }
   | { Database: string };
@@ -52,6 +64,25 @@ export type CandidCellError =
 export type CandidResult<T> = { Ok: T } | { Err: CandidCellError };
 
 export type CandidFencing = [string, string, bigint];
+
+type Opt<T> = [] | [T];
+
+export type CandidCellOp =
+  | { KvPut: { key: string; value: Uint8Array } }
+  | { KvDelete: { key: string } }
+  | { KvDeleteAll: null }
+  | { SetAlarm: Opt<bigint> }
+  | { AssertKv: { key: string; expected: Opt<Uint8Array> } }
+  | { Sql: { sql: string; args: CandidSqlValue[] } };
+
+type CandidLease = {
+  cell_id: string;
+  owner_id: string;
+  epoch: bigint;
+  expires_at_ns: bigint;
+};
+
+type CandidKvEntry = { key: string; value: Uint8Array | number[] };
 
 /**
  * Minimal actor interface compatible with `@dfinity/agent`'s `Actor.createActor`.
@@ -84,6 +115,72 @@ export interface CanisterActor {
     sql: string,
     args: CandidSqlValue[],
   ): Promise<CandidResult<{ rows: CandidSqlValue[][] }>>;
+  activate_cell(
+    cellId: string,
+    ownerId: string,
+    ttlNs: bigint,
+    preloadBytes: bigint,
+  ): Promise<
+    CandidResult<{
+      lease: CandidLease;
+      entries: CandidKvEntry[];
+      complete: boolean;
+      alarm_at_ns: Opt<bigint>;
+    }>
+  >;
+  cell_transact(req: {
+    fencing: CandidFencing;
+    idempotency_key: Opt<string>;
+    ops: CandidCellOp[];
+  }): Promise<
+    CandidResult<{
+      results: { rows_affected: bigint; rows: CandidSqlValue[][] }[];
+      idempotent_replay: boolean;
+      epoch: bigint;
+    }>
+  >;
+  cell_kv_get(cellId: string, keys: string[]): Promise<CandidResult<Opt<Uint8Array | number[]>[]>>;
+  cell_kv_list(
+    cellId: string,
+    opts: {
+      prefix: Opt<string>;
+      start_after: Opt<string>;
+      limit: Opt<number>;
+      reverse: Opt<boolean>;
+    },
+  ): Promise<CandidResult<{ entries: CandidKvEntry[]; truncated: boolean }>>;
+  cell_get_alarm(cellId: string): Promise<CandidResult<Opt<bigint>>>;
+  list_due_alarms(limit: number): Promise<CandidResult<{ cell_id: string; at_ns: bigint }[]>>;
+}
+
+function opt<T>(v: T | null | undefined): Opt<T> {
+  return v === null || v === undefined ? [] : [v];
+}
+
+/** `@dfinity/candid` may decode `blob` as `number[]`; normalize it. */
+function bytes(v: Uint8Array | number[]): Uint8Array {
+  return v instanceof Uint8Array ? v : Uint8Array.from(v);
+}
+
+export function encodeCellOp(op: CellOp): CandidCellOp {
+  switch (op.kind) {
+    case "put":
+      return { KvPut: { key: op.key, value: op.value } };
+    case "delete":
+      return { KvDelete: { key: op.key } };
+    case "deleteAll":
+      return { KvDeleteAll: null };
+    case "setAlarm":
+      return { SetAlarm: opt(op.atNs) };
+    case "assert":
+      return { AssertKv: { key: op.key, expected: opt(op.expected) } };
+    case "sql":
+      return { Sql: { sql: op.sql, args: op.args.map(encodeSqlParam) } };
+  }
+}
+
+function decodeLease(l: CandidLease): LeaseRecord {
+  return { cellId: l.cell_id, ownerId: l.owner_id, epoch: l.epoch, expiresAtNs: l.expires_at_ns };
 }
 
 export function encodeSqlParam(param: SqlParam): CandidSqlValue {
@@ -101,7 +198,7 @@ export function decodeSqlValue(value: CandidSqlValue): SqlParam {
   if ("Integer" in value) return value.Integer;
   if ("Real" in value) return value.Real;
   if ("Text" in value) return value.Text;
-  return value.Blob;
+  return bytes(value.Blob as Uint8Array | number[]);
 }
 
 export function unwrapCandidResult<T>(res: CandidResult<T>): T {
@@ -129,10 +226,10 @@ export function unwrapCandidResult<T>(res: CandidResult<T>): T {
   }
   if ("LeaseHeldByAnother" in err) {
     const l = err.LeaseHeldByAnother;
-    throw new IcCellError(
-      "LEASE_HELD",
-      `Lease for '${l.cell_id}' held by '${l.current_owner}' until ${l.expires_at_ns}`,
-    );
+    throw new LeaseHeldError(l.cell_id, l.current_owner, l.expires_at_ns);
+  }
+  if ("PreconditionFailed" in err) {
+    throw new PreconditionFailedError(err.PreconditionFailed.reason);
   }
   if ("NotOwner" in err) {
     throw new IcCellError("NOT_OWNER", `Not owner of cell '${err.NotOwner.cell_id}'`);
@@ -149,7 +246,7 @@ export function unwrapCandidResult<T>(res: CandidResult<T>): T {
 /**
  * `IcDbTransport` backed by a live `@dfinity/agent` Canister Actor.
  */
-export class CandidActorTransport implements IcDbTransport {
+export class CandidActorTransport implements IcDbTransport, CellTransport {
   private readonly actor: CanisterActor;
 
   constructor(actor: CanisterActor) {
@@ -192,5 +289,73 @@ export class CandidActorTransport implements IcDbTransport {
         : await this.actor.sql_query_eventual(sql, args);
     const raw = unwrapCandidResult(res);
     return raw.rows.map((row) => row.map(decodeSqlValue));
+  }
+
+  async activateCell(
+    cellId: string,
+    ownerId: string,
+    ttlNs: bigint,
+    preloadBytes: bigint,
+  ): Promise<Activation> {
+    const raw = unwrapCandidResult(
+      await this.actor.activate_cell(cellId, ownerId, ttlNs, preloadBytes),
+    );
+    return {
+      lease: decodeLease(raw.lease),
+      entries: raw.entries.map((e) => ({ key: e.key, value: bytes(e.value) })),
+      complete: raw.complete,
+      alarmAtNs: raw.alarm_at_ns[0] ?? null,
+    };
+  }
+
+  async transact(
+    fencing: FencingToken,
+    ops: CellOp[],
+    idempotencyKey?: string,
+  ): Promise<TransactResult> {
+    const raw = unwrapCandidResult(
+      await this.actor.cell_transact({
+        fencing: [fencing.cellId, fencing.ownerId, fencing.epoch],
+        idempotency_key: opt(idempotencyKey),
+        ops: ops.map(encodeCellOp),
+      }),
+    );
+    return {
+      results: raw.results.map((r) => ({
+        rowsAffected: r.rows_affected,
+        rows: r.rows.map((row) => row.map(decodeSqlValue)),
+      })),
+      idempotentReplay: raw.idempotent_replay,
+      epoch: raw.epoch,
+    };
+  }
+
+  async kvGet(cellId: string, keys: string[]): Promise<(Uint8Array | null)[]> {
+    const raw = unwrapCandidResult(await this.actor.cell_kv_get(cellId, keys));
+    return raw.map((v) => (v.length === 0 ? null : bytes(v[0])));
+  }
+
+  async kvList(cellId: string, options: KvListOptions): Promise<KvListResult> {
+    const raw = unwrapCandidResult(
+      await this.actor.cell_kv_list(cellId, {
+        prefix: opt(options.prefix),
+        start_after: opt(options.startAfter),
+        limit: opt(options.limit),
+        reverse: opt(options.reverse),
+      }),
+    );
+    return {
+      entries: raw.entries.map((e) => ({ key: e.key, value: bytes(e.value) })),
+      truncated: raw.truncated,
+    };
+  }
+
+  async getAlarm(cellId: string): Promise<bigint | null> {
+    return unwrapCandidResult(await this.actor.cell_get_alarm(cellId))[0] ?? null;
+  }
+
+  async listDueAlarms(limit: number): Promise<DueAlarm[]> {
+    const raw = unwrapCandidResult(await this.actor.list_due_alarms(limit));
+    return raw.map((a) => ({ cellId: a.cell_id, atNs: a.at_ns }));
   }
 }

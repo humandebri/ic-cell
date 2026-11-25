@@ -27,6 +27,9 @@ type CellError = variant {
     reason : text;
   };
   Unauthorized;
+  PreconditionFailed : record {
+    reason : text;
+  };
   Transport : text;
   InvalidArgument : text;
   Database : text;
@@ -102,6 +105,55 @@ type InitArgs = record {
 
 type Fencing = record { text; text; nat64 };
 
+type CellOp = variant {
+  KvPut : record { key : text; value : blob };
+  KvDelete : record { key : text };
+  KvDeleteAll;
+  SetAlarm : opt nat64;
+  AssertKv : record { key : text; expected : opt blob };
+  Sql : record { sql : text; args : vec SqlValue };
+};
+
+type TransactRequest = record {
+  fencing : Fencing;
+  idempotency_key : opt text;
+  ops : vec CellOp;
+};
+
+type OpResult = record {
+  rows_affected : nat64;
+  rows : vec vec SqlValue;
+};
+
+type TransactResult = record {
+  results : vec OpResult;
+  idempotent_replay : bool;
+  epoch : nat64;
+};
+
+type KvEntry = record { key : text; value : blob };
+
+type KvListOptions = record {
+  prefix : opt text;
+  start_after : opt text;
+  limit : opt nat32;
+  reverse : opt bool;
+};
+
+type KvListResult = record {
+  entries : vec KvEntry;
+  truncated : bool;
+};
+
+type DueAlarm = record { cell_id : text; at_ns : nat64 };
+
+type Activation = record {
+  lease : LeaseRecord;
+  entries : vec KvEntry;
+  complete : bool;
+  alarm_at_ns : opt nat64;
+};
+
 service : (opt InitArgs) -> {
   add_authorized_caller : (principal) -> (variant { Ok : bool; Err : CellError });
   remove_authorized_caller : (principal) -> (variant { Ok : bool; Err : CellError });
@@ -110,6 +162,13 @@ service : (opt InitArgs) -> {
   acquire_lease : (text, text, nat64) -> (variant { Ok : LeaseRecord; Err : CellError });
   release_lease : (text, text, nat64) -> (variant { Ok; Err : CellError });
   get_lease : (text) -> (variant { Ok : opt LeaseRecord; Err : CellError });
+
+  activate_cell : (text, text, nat64, nat64) -> (variant { Ok : Activation; Err : CellError });
+  cell_transact : (TransactRequest) -> (variant { Ok : TransactResult; Err : CellError });
+  cell_kv_get : (text, vec text) -> (variant { Ok : vec opt blob; Err : CellError });
+  cell_kv_list : (text, KvListOptions) -> (variant { Ok : KvListResult; Err : CellError });
+  cell_get_alarm : (text) -> (variant { Ok : opt nat64; Err : CellError });
+  list_due_alarms : (nat32) -> (variant { Ok : vec DueAlarm; Err : CellError });
 
   put_object : (text, blob, nat64, opt Fencing) -> (variant { Ok : ObjectRecord; Err : CellError });
   get_object_strong : (text) -> (variant { Ok : opt ObjectRecord; Err : CellError });

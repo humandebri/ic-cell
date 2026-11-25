@@ -43,6 +43,30 @@ pub const MIGRATIONS: &[Migration] = &[
             );
         ",
     },
+    Migration {
+        version: 3,
+        sql: "
+            CREATE TABLE _ic_cell_kv (
+                cell_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value BLOB NOT NULL,
+                PRIMARY KEY (cell_id, key)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE _ic_cell_alarms (
+                cell_id TEXT PRIMARY KEY NOT NULL,
+                at_ns INTEGER NOT NULL
+            );
+            CREATE INDEX _ic_cell_alarms_by_time ON _ic_cell_alarms (at_ns);
+
+            CREATE TABLE _ic_cell_txn_results (
+                idempotency_key TEXT PRIMARY KEY NOT NULL,
+                cell_id TEXT NOT NULL,
+                result BLOB NOT NULL,
+                created_at_ns INTEGER NOT NULL
+            );
+        ",
+    },
 ];
 
 pub fn put_object_create(
@@ -204,6 +228,7 @@ pub fn execute_sql(
     idempotency_key: Option<String>,
     fencing: Option<(String, String, u64)>,
 ) -> Result<ExecResult, CellError> {
+    crate::cells::check_user_sql(&sql)?;
     Db::update(|conn| -> Result<Result<ExecResult, CellError>, DbError> {
         if let Some((cell_id, owner_id, epoch)) = fencing.as_ref() {
             if let Err(err) = verify_fencing_epoch(conn, cell_id, owner_id, *epoch)? {
@@ -245,30 +270,14 @@ pub fn execute_sql(
     .map_err(db_err)?
 }
 
-pub fn query_sql(
-    sql: String,
-    args: Vec<SqlValue>,
-    strong: bool,
-) -> Result<QueryResult, CellError> {
+pub fn query_sql(sql: String, args: Vec<SqlValue>, strong: bool) -> Result<QueryResult, CellError> {
+    crate::cells::check_user_sql(&sql)?;
     let run = |conn: &Connection| -> Result<QueryResult, DbError> {
         let vfs_values: Vec<VfsValue<'_>> = args.iter().map(to_vfs_value).collect();
         let refs: Vec<&dyn ToSql> = vfs_values.iter().map(|v| v as &dyn ToSql).collect();
-        let rows = conn.query_all(&sql, &refs, |row| {
-            let count = row.column_count();
-            let mut out = Vec::with_capacity(count);
-            for i in 0..count {
-                let val = match row.get_value(i)? {
-                    ColumnValue::Null => SqlValue::Null,
-                    ColumnValue::Integer(v) => SqlValue::Integer(v),
-                    ColumnValue::Real(v) => SqlValue::Real(v),
-                    ColumnValue::Text(v) => SqlValue::Text(v),
-                    ColumnValue::Blob(v) => SqlValue::Blob(v),
-                };
-                out.push(val);
-            }
-            Ok(out)
-        })?;
-        Ok(QueryResult { rows })
+        Ok(QueryResult {
+            rows: query_rows(conn, &sql, &refs)?,
+        })
     };
 
     if strong {
@@ -276,6 +285,28 @@ pub fn query_sql(
     } else {
         Db::query(run).map_err(db_err)
     }
+}
+
+/// Runs `sql` and returns every row as `SqlValue`s.
+pub(crate) fn query_rows(
+    conn: &Connection,
+    sql: &str,
+    refs: &[&dyn ToSql],
+) -> Result<Vec<Vec<SqlValue>>, DbError> {
+    conn.query_all(sql, refs, |row| {
+        let count = row.column_count();
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            out.push(match row.get_value(i)? {
+                ColumnValue::Null => SqlValue::Null,
+                ColumnValue::Integer(v) => SqlValue::Integer(v),
+                ColumnValue::Real(v) => SqlValue::Real(v),
+                ColumnValue::Text(v) => SqlValue::Text(v),
+                ColumnValue::Blob(v) => SqlValue::Blob(v),
+            });
+        }
+        Ok(out)
+    })
 }
 
 pub fn gc_idempotency(older_than_ns: u64) -> Result<u64, CellError> {
@@ -300,7 +331,7 @@ pub fn abort_chunked_upload(upload_id: &str) -> Result<u64, CellError> {
     .map_err(db_err)
 }
 
-fn to_vfs_value(v: &SqlValue) -> VfsValue<'_> {
+pub(crate) fn to_vfs_value(v: &SqlValue) -> VfsValue<'_> {
     match v {
         SqlValue::Null => VfsValue::Null,
         SqlValue::Integer(i) => VfsValue::Integer(*i),

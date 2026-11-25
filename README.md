@@ -89,6 +89,7 @@ ic-cell/
 │   │   └── src/
 │   │       ├── lib.rs          # Canister エントリポイント（認可・アップグレード）
 │   │       ├── auth.rs         # Stable Memory に永続化される許可リスト
+│   │       ├── cells.rs        # Durable Cells（Cell ごとの KV・アラーム・原子的 transact）
 │   │       ├── storage.rs      # SQL / オブジェクト / チャンクアップロード
 │   │       ├── ownership.rs    # Lease・Fencing Epoch
 │   │       └── replication.rs  # LTX ページ差分適用・LTX チェックサム・ステージング
@@ -101,7 +102,7 @@ ic-cell/
 │   │       └── object_store_adapter.rs # object_store::ObjectStore 実装
 │   └── ic-cell-e2e/          # PocketIC 上で実 wasm を使う E2E テスト
 ├── packages/
-│   └── typescript-sdk/       # Workers / Durable Objects 向け IC_DB バインディング
+│   └── typescript-sdk/       # IC_DB バインディング + Durable Cells ランタイム（runtime.ts）
 ├── examples/
 │   ├── durable-counter/      # 最小構成サンプル
 │   └── immortal-agent/       # サーバーが消えても状態が残る AI Agent デモ
@@ -109,6 +110,52 @@ ic-cell/
     ├── PLAN.md               # 詳細な実装計画・技術課題
     └── adr/                  # Architecture Decision Records
 ```
+
+## Durable Cells（Durable Objects 互換）
+
+1 つの ID につきクラスタ全体で 1 インスタンスだけが動き、呼び出しは直列に実行されます。各呼び出しの書き込みは、ic-cell Canister への 1 回の原子的コミットにまとまります（詳細は [ADR-0006](./docs/adr/0006-durable-cells.md)）。
+
+```ts
+import { Actor, HttpAgent } from "@dfinity/agent";
+import { CandidActorTransport, CellNamespace, HttpForwarder, idlFactory, type CellState } from "@ic-cell/sdk";
+
+class Counter {
+  private readonly state: CellState;
+  constructor(state: CellState) {
+    this.state = state;
+  }
+  async increment() {
+    const n = ((await this.state.storage.get<number>("n")) ?? 0) + 1;
+    await this.state.storage.put("n", n); // 呼び出し終了時に fenced + atomic にコミット
+    return n;
+  }
+  async alarm() { /* storage.setAlarm() で予約した処理 */ }
+}
+
+const actor = Actor.createActor(idlFactory, { agent: await HttpAgent.create({ host, identity }), canisterId });
+const counters = new CellNamespace({
+  transport: new CandidActorTransport(actor),
+  nodeId: "node-a",                                   // Lease の owner として記録される
+  forwarder: new HttpForwarder((owner) => nodeUrls[owner]), // 他ノードが owner なら転送
+  create: (state) => new Counter(state),
+  env: {},
+});
+await counters.get<Counter>("room-42").increment();
+// 受信側: counters.handleHttp(request) を RPC エンドポイントとして公開
+// 死んだ owner のアラーム回収: counters.startAlarmPoller()
+```
+
+| DO の性質 | Durable Cells |
+| --- | --- |
+| ID ごとに 1 インスタンス | ✅ Lease + Fencing、非 owner からは転送 |
+| 直列実行 | ✅ 厳密な直列（インターリーブなし） |
+| 書き込みの原子性 / 出力ゲート | ✅ 呼び出し単位で 1 回の `cell_transact` |
+| `transaction()` / ロールバック | ✅ |
+| Storage API（get / put / delete / list / deleteAll） | ✅（Cell ごとに分離された KV） |
+| SQL | ✅ 同じトランザクション内で実行（テーブルは全 Cell 共有） |
+| Alarm | ✅ 再試行付き。`pollAlarms` でフェイルオーバー |
+| 低レイテンシの書き込み | ⚠️ 書き込みを含む呼び出しは 1 回の update call（1〜2 秒）を待つ |
+| WebSocket / Hibernation | ✗ 対象外 |
 
 ## テスト
 
@@ -118,7 +165,10 @@ cargo test --workspace -- --test-threads=1
 
 # PocketIC E2E（実 wasm のデプロイ・アップグレード・ic-agent 経由の LTX / object_store）
 cargo build -p ic-cell-canister --target wasm32-unknown-unknown --release
-cargo test -p ic-cell-e2e -- --test-threads=1
+cargo test -p ic-cell-e2e -- --test-threads=1   # TS ランタイムの実 Canister テストを含む
+
+# TypeScript SDK（初回のみ: cd packages/typescript-sdk && bun install）
+cd packages/typescript-sdk && bun x tsc -p . && node --experimental-strip-types --test test/*.test.ts
 ```
 
 PocketIC サーバーは `POCKET_IC_BIN`、`dfx` 同梱のバイナリ（`~/.cache/dfinity/versions/*/pocket-ic`）の順に探し、見つからなければ自動ダウンロードされます。wasm が無い場合 E2E はスキップされます（CI では `IC_CELL_E2E_REQUIRED=1` で必須化）。

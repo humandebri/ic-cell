@@ -523,3 +523,217 @@ fn ltx_files_and_object_store_over_ic_agent() {
     drop(rt);
     drop(store);
 }
+
+#[test]
+#[serial]
+fn durable_cells_failover_alarms_and_upgrade_on_real_wasm() {
+    use ic_cell_client::{
+        Activation, CellOp, DueAlarm, KvListOptions, KvListResult, TransactRequest, TransactResult,
+    };
+    use std::time::Duration;
+
+    let Some(wasm) = wasm() else { return };
+    let pic = pocket_ic();
+    let controller = principal(1);
+    let app = principal(2);
+    let cid = install(&pic, &wasm, controller, vec![app]);
+    let sec = 1_000_000_000u64;
+
+    let activate = |owner: &str| -> Result<Activation, CellError> {
+        update(
+            &pic,
+            cid,
+            app,
+            "activate_cell",
+            encode_args(("room-1", owner, 5 * sec, 1u64 << 20)).unwrap(),
+        )
+    };
+    let transact = |f: (String, String, u64),
+                    key: Option<&str>,
+                    ops: Vec<CellOp>|
+     -> Result<TransactResult, CellError> {
+        update(
+            &pic,
+            cid,
+            app,
+            "cell_transact",
+            encode_one(TransactRequest {
+                fencing: f,
+                idempotency_key: key.map(Into::into),
+                ops,
+            })
+            .unwrap(),
+        )
+    };
+    let fencing = |a: &Activation| {
+        (
+            a.lease.cell_id.clone(),
+            a.lease.owner_id.clone(),
+            a.lease.epoch,
+        )
+    };
+
+    // node-a owns the cell and writes atomically.
+    let a = activate("node-a").unwrap();
+    assert!(a.complete && a.entries.is_empty());
+    let now: u64 = pic.get_time().as_nanos_since_unix_epoch();
+    let r = transact(
+        fencing(&a),
+        Some("a-1"),
+        vec![
+            CellOp::KvPut {
+                key: "count".into(),
+                value: b"1".to_vec(),
+            },
+            CellOp::KvPut {
+                key: "msg:1".into(),
+                value: b"hello".to_vec(),
+            },
+            CellOp::SetAlarm(Some(now + 30 * sec)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(r.epoch, 1);
+    assert!(
+        transact(fencing(&a), Some("a-1"), vec![])
+            .unwrap()
+            .idempotent_replay
+    );
+
+    // node-b cannot take a live cell.
+    assert!(matches!(
+        activate("node-b"),
+        Err(CellError::LeaseHeldByAnother { .. })
+    ));
+
+    // node-a dies; after the TTL, node-b takes over with a higher epoch and sees the state.
+    pic.advance_time(Duration::from_secs(6));
+    pic.tick();
+    let b = activate("node-b").unwrap();
+    assert_eq!(b.lease.epoch, 2);
+    assert!(b.complete);
+    let keys: Vec<&str> = b.entries.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(keys, ["count", "msg:1"]);
+    assert_eq!(b.alarm_at_ns, Some(now + 30 * sec));
+
+    // A zombie write from node-a is fenced out and changes nothing.
+    assert!(matches!(
+        transact(
+            fencing(&a),
+            None,
+            vec![CellOp::KvPut {
+                key: "count".into(),
+                value: b"999".to_vec()
+            }]
+        ),
+        Err(CellError::StaleEpoch { .. })
+    ));
+    let got: Result<Vec<Option<Vec<u8>>>, CellError> = update(
+        &pic,
+        cid,
+        app,
+        "cell_kv_get",
+        encode_args(("room-1", vec!["count".to_string()])).unwrap(),
+    );
+    assert_eq!(got.unwrap(), vec![Some(b"1".to_vec())]);
+
+    // Internal tables are unreachable through SQL.
+    assert!(matches!(
+        sql(&pic, cid, app, "UPDATE _ic_cell_leases SET epoch = 0", None),
+        Err(CellError::InvalidArgument(_))
+    ));
+
+    // Alarms become due on consensus time.
+    let due = |pic: &PocketIc| -> Vec<DueAlarm> {
+        update::<Result<Vec<DueAlarm>, CellError>>(
+            pic,
+            cid,
+            app,
+            "list_due_alarms",
+            encode_one(10u32).unwrap(),
+        )
+        .unwrap()
+    };
+    assert!(due(&pic).is_empty());
+    pic.advance_time(Duration::from_secs(30));
+    pic.tick();
+    assert_eq!(
+        due(&pic)
+            .iter()
+            .map(|d| d.cell_id.as_str())
+            .collect::<Vec<_>>(),
+        ["room-1"]
+    );
+
+    // Everything survives an upgrade.
+    pic.upgrade_canister(
+        cid,
+        wasm,
+        encode_one(None::<InitArgs>).unwrap(),
+        Some(controller),
+    )
+    .expect("upgrade");
+    let listed: Result<KvListResult, CellError> = update(
+        &pic,
+        cid,
+        app,
+        "cell_kv_list",
+        encode_args((
+            "room-1",
+            KvListOptions {
+                prefix: Some("msg:".into()),
+                ..Default::default()
+            },
+        ))
+        .unwrap(),
+    );
+    assert_eq!(listed.unwrap().entries.len(), 1);
+    assert_eq!(due(&pic).len(), 1);
+    // node-b's lease (epoch 2) is still the fencing authority after upgrade.
+    pic.advance_time(Duration::from_secs(10));
+    let b2 = activate("node-b").unwrap();
+    assert_eq!(b2.lease.epoch, 2, "same owner keeps its epoch on renewal");
+    transact(fencing(&b2), None, vec![CellOp::SetAlarm(None)]).unwrap();
+    assert!(due(&pic).is_empty());
+}
+
+/// Runs `packages/typescript-sdk/e2e/live.ts` (Durable Cells runtime +
+/// `@dfinity/agent`) against the real wasm in PocketIC live mode.
+#[test]
+#[serial]
+fn typescript_runtime_against_real_canister() {
+    let Some(wasm) = wasm() else { return };
+    let sdk = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packages/typescript-sdk");
+    let node_ok = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !node_ok || !sdk.join("node_modules/@dfinity/agent").exists() {
+        assert!(
+            !required(),
+            "node and `bun install` in packages/typescript-sdk are required"
+        );
+        eprintln!("SKIP: node or packages/typescript-sdk/node_modules missing");
+        return;
+    }
+
+    let mut pic = pocket_ic();
+    let controller = principal(1);
+    let ts_principal = agent_identity().sender().unwrap(); // same seed as live.ts
+    let cid = install(&pic, &wasm, controller, vec![ts_principal]);
+    let url = pic.make_live(None);
+
+    let out = std::process::Command::new("node")
+        .args(["--experimental-strip-types", "--no-warnings", "e2e/live.ts"])
+        .current_dir(&sdk)
+        .env("IC_URL", url.as_str().trim_end_matches('/'))
+        .env("CANISTER_ID", cid.to_text())
+        .output()
+        .expect("spawn node");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("\"ok\":true"),
+        "live.ts failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}

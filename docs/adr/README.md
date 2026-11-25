@@ -11,6 +11,7 @@
 | [ADR-0003](./0003-ltx-replication-to-ic-sqlite-vfs.md) | LTX ページ差分の `ic-sqlite-vfs` への適用方針 | Proposed |
 | [ADR-0004](./0004-icp-object-storage-backend.md) | `celld` 向け ICP Object Storage Backend (`StorageBackend::Ic`) の設計 | Proposed |
 | [ADR-0005](./0005-caller-authorization.md) | 呼び出し元許可リストの永続化と管理 API | Accepted |
+| [ADR-0006](./0006-durable-cells.md) | Durable Cells — Durable Objects 互換の実行モデル | Accepted |
 
 ## ステータス定義
 

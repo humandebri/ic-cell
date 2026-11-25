@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod cells;
 pub mod ownership;
 pub mod replication;
 pub mod storage;
@@ -8,8 +9,9 @@ use candid::Principal;
 use ic_sqlite_vfs::{Db, DefaultMemoryImpl, Memory, MemoryId, MemoryManager};
 use std::cell::RefCell;
 use types::{
-    CellError, ExecResult, InitArgs, LeaseRecord, LtxDeltaRequest, ObjectMeta, ObjectRecord,
-    PageDelta, QueryResult, ReplicationState, SqlValue, MAX_REPLY_PAYLOAD_BYTES,
+    Activation, CellError, DueAlarm, ExecResult, InitArgs, KvListOptions, KvListResult,
+    LeaseRecord, LtxDeltaRequest, ObjectMeta, ObjectRecord, PageDelta, QueryResult,
+    ReplicationState, SqlValue, TransactRequest, TransactResult, MAX_REPLY_PAYLOAD_BYTES,
 };
 
 const SQLITE_MEMORY_ID: MemoryId = MemoryId::new(120);
@@ -250,7 +252,51 @@ pub fn sql_query_eventual(sql: String, args: Vec<SqlValue>) -> Result<QueryResul
 #[ic_cdk::update]
 pub fn gc_idempotency(older_than_ns: u64) -> Result<u64, CellError> {
     authorize_caller()?;
-    storage::gc_idempotency(older_than_ns)
+    Ok(storage::gc_idempotency(older_than_ns)? + cells::gc_txn_results(older_than_ns)?)
+}
+
+// ---- Durable Cells ---------------------------------------------------------
+
+#[ic_cdk::update]
+pub fn activate_cell(
+    cell_id: String,
+    owner_id: String,
+    ttl_ns: u64,
+    preload_bytes: u64,
+) -> Result<Activation, CellError> {
+    authorize_caller()?;
+    cells::activate_cell(cell_id, owner_id, ttl_ns, preload_bytes, now_ns())
+}
+
+#[ic_cdk::update]
+pub fn cell_transact(req: TransactRequest) -> Result<TransactResult, CellError> {
+    authorize_caller()?;
+    cells::transact(req, now_ns())
+}
+
+#[ic_cdk::update]
+pub fn cell_kv_get(cell_id: String, keys: Vec<String>) -> Result<Vec<Option<Vec<u8>>>, CellError> {
+    authorize_caller()?;
+    cells::kv_get(&cell_id, &keys)
+}
+
+#[ic_cdk::update]
+pub fn cell_kv_list(cell_id: String, opts: KvListOptions) -> Result<KvListResult, CellError> {
+    authorize_caller()?;
+    cells::kv_list(&cell_id, &opts)
+}
+
+#[ic_cdk::update]
+pub fn cell_get_alarm(cell_id: String) -> Result<Option<u64>, CellError> {
+    authorize_caller()?;
+    cells::get_alarm(&cell_id)
+}
+
+/// Due alarms at canister time (consensus time).
+#[ic_cdk::update]
+pub fn list_due_alarms(limit: u32) -> Result<Vec<DueAlarm>, CellError> {
+    authorize_caller()?;
+    cells::list_due_alarms(now_ns(), limit)
 }
 
 #[ic_cdk::update]
@@ -382,6 +428,38 @@ mod tests {
         service_equal(CandidSource::Text(&exported), CandidSource::File(&did)).unwrap_or_else(
             |e| panic!("ic_cell_canister.did is out of date: {e}\n--- exported ---\n{exported}"),
         );
+    }
+
+    /// Keeps the TypeScript SDK's generated bindings in sync with the .did.
+    /// Regenerate with `UPDATE_BINDINGS=1 cargo test -p ic-cell-canister bindings`.
+    #[test]
+    fn typescript_bindings_are_up_to_date() {
+        use candid_parser::bindings::{javascript, typescript};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (env, actor, prog) =
+            candid_parser::typing::check_file(&root.join("ic_cell_canister.did")).unwrap();
+        let header =
+            "// Generated from crates/ic-cell-canister/ic_cell_canister.did. Do not edit.\n";
+        let js = format!("{header}{}", javascript::compile(&env, &actor));
+        let dts = format!("{header}{}", typescript::compile(&env, &actor, &prog));
+        let out = root.join("../../packages/typescript-sdk/src/generated");
+        let files = [
+            ("ic_cell_canister.did.js", js),
+            ("ic_cell_canister.did.d.ts", dts),
+        ];
+        if std::env::var_os("UPDATE_BINDINGS").is_some() {
+            std::fs::create_dir_all(&out).unwrap();
+            for (name, text) in &files {
+                std::fs::write(out.join(name), text).unwrap();
+            }
+        }
+        for (name, text) in &files {
+            let current = std::fs::read_to_string(out.join(name)).unwrap_or_default();
+            assert!(
+                current == *text,
+                "{name} is stale; run UPDATE_BINDINGS=1 cargo test -p ic-cell-canister bindings"
+            );
+        }
     }
 
     #[test]
@@ -535,5 +613,260 @@ mod tests {
         // GC removes idempotency records older than threshold
         assert_eq!(storage::gc_idempotency(105).unwrap(), 1);
         assert_eq!(storage::gc_idempotency(105).unwrap(), 0);
+    }
+
+    mod durable_cells {
+        use super::*;
+        use crate::types::{CellOp, KvListOptions, TransactRequest};
+
+        fn lease(cell: &str, owner: &str, now: u64) -> (String, String, u64) {
+            let l = ownership::acquire_or_renew_lease(cell.into(), owner.into(), 100, now).unwrap();
+            (l.cell_id, l.owner_id, l.epoch)
+        }
+
+        fn put(key: &str, value: &[u8]) -> CellOp {
+            CellOp::KvPut {
+                key: key.into(),
+                value: value.to_vec(),
+            }
+        }
+
+        fn tx(
+            fencing: &(String, String, u64),
+            key: Option<&str>,
+            ops: Vec<CellOp>,
+        ) -> TransactRequest {
+            TransactRequest {
+                fencing: fencing.clone(),
+                idempotency_key: key.map(Into::into),
+                ops,
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn transactions_are_atomic_fenced_and_idempotent() {
+            let _g = setup_fresh_db();
+            let f = lease("c1", "node-a", 0);
+
+            // A failed precondition rolls back earlier ops in the same transaction.
+            let err = cells::transact(
+                tx(
+                    &f,
+                    None,
+                    vec![
+                        put("a", b"1"),
+                        CellOp::AssertKv {
+                            key: "b".into(),
+                            expected: Some(b"x".to_vec()),
+                        },
+                    ],
+                ),
+                1,
+            )
+            .unwrap_err();
+            assert!(matches!(err, CellError::PreconditionFailed { .. }));
+            assert_eq!(cells::kv_get("c1", &["a".into()]).unwrap(), vec![None]);
+
+            // A SQL error in the middle also rolls everything back.
+            let err = cells::transact(
+                tx(
+                    &f,
+                    None,
+                    vec![
+                        put("a", b"1"),
+                        CellOp::Sql {
+                            sql: "INSERT INTO no_such_table VALUES (1)".into(),
+                            args: vec![],
+                        },
+                    ],
+                ),
+                1,
+            )
+            .unwrap_err();
+            assert!(matches!(err, CellError::Database(_)));
+            assert_eq!(cells::kv_get("c1", &["a".into()]).unwrap(), vec![None]);
+
+            // Read-modify-write in one call via SQL RETURNING, retried with the same key.
+            storage::execute_sql(
+                "CREATE TABLE counters (id TEXT PRIMARY KEY, v INTEGER NOT NULL)".into(),
+                vec![],
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+            let bump = || {
+                vec![
+                    put("a", b"1"),
+                    CellOp::AssertKv {
+                        key: "a".into(),
+                        expected: Some(b"1".to_vec()),
+                    },
+                    CellOp::Sql {
+                        sql: "INSERT INTO counters VALUES ('n', 1)
+                              ON CONFLICT(id) DO UPDATE SET v = v + 1 RETURNING v"
+                            .into(),
+                        args: vec![],
+                    },
+                ]
+            };
+            let first = cells::transact(tx(&f, Some("t-1"), bump()), 2).unwrap();
+            assert!(!first.idempotent_replay);
+            assert_eq!(first.results[2].rows, vec![vec![SqlValue::Integer(1)]]);
+            assert_eq!(first.results[2].rows_affected, 1);
+            let replay = cells::transact(tx(&f, Some("t-1"), bump()), 3).unwrap();
+            assert!(replay.idempotent_replay);
+            assert_eq!(replay.results, first.results);
+            let second = cells::transact(tx(&f, Some("t-2"), bump()), 4).unwrap();
+            assert_eq!(second.results[2].rows, vec![vec![SqlValue::Integer(2)]]);
+
+            // Another cell cannot reuse the key, and a stale owner is fenced out.
+            let g = lease("c2", "node-a", 0);
+            assert!(matches!(
+                cells::transact(tx(&g, Some("t-1"), vec![]), 5),
+                Err(CellError::InvalidArgument(_))
+            ));
+            let taken = ownership::acquire_or_renew_lease("c1".into(), "node-b".into(), 100, 1_000)
+                .unwrap();
+            assert_eq!(taken.epoch, f.2 + 1);
+            assert!(matches!(
+                cells::transact(tx(&f, None, vec![put("a", b"zombie")]), 1_001),
+                Err(CellError::StaleEpoch { .. })
+            ));
+            assert_eq!(
+                cells::kv_get("c1", &["a".into()]).unwrap(),
+                vec![Some(b"1".to_vec())]
+            );
+
+            // GC drops stored results.
+            assert_eq!(cells::gc_txn_results(10).unwrap(), 2);
+        }
+
+        #[test]
+        #[serial]
+        fn internal_tables_are_off_limits_to_user_sql() {
+            let _g = setup_fresh_db();
+            let f = lease("c1", "a", 0);
+            for sql in [
+                "UPDATE _ic_cell_leases SET epoch = 1",
+                "delete from \"_IC_CELL_KV\"",
+            ] {
+                assert!(matches!(
+                    storage::execute_sql(sql.into(), vec![], 0, None, None),
+                    Err(CellError::InvalidArgument(_))
+                ));
+                assert!(matches!(
+                    storage::query_sql(sql.into(), vec![], true),
+                    Err(CellError::InvalidArgument(_))
+                ));
+                assert!(matches!(
+                    cells::transact(
+                        tx(
+                            &f,
+                            None,
+                            vec![CellOp::Sql {
+                                sql: sql.into(),
+                                args: vec![]
+                            }]
+                        ),
+                        1
+                    ),
+                    Err(CellError::InvalidArgument(_))
+                ));
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn kv_isolation_listing_alarms_and_activation() {
+            let _g = setup_fresh_db();
+            let a = lease("cell-a", "n", 0);
+            let b = lease("cell-b", "n", 0);
+            let mut ops: Vec<CellOp> = (0..5)
+                .map(|i| put(&format!("user:{i}"), &[i as u8]))
+                .collect();
+            ops.push(put("meta", b"m"));
+            ops.push(CellOp::SetAlarm(Some(500)));
+            cells::transact(tx(&a, None, ops), 1).unwrap();
+            cells::transact(
+                tx(
+                    &b,
+                    None,
+                    vec![put("user:0", b"other"), CellOp::SetAlarm(Some(50))],
+                ),
+                1,
+            )
+            .unwrap();
+
+            assert_eq!(
+                cells::kv_get("cell-a", &["user:0".into(), "nope".into()]).unwrap(),
+                vec![Some(vec![0]), None]
+            );
+            assert_eq!(
+                cells::kv_get("cell-b", &["user:0".into()]).unwrap(),
+                vec![Some(b"other".to_vec())]
+            );
+
+            // Paginate a prefix in both directions.
+            let page = |start_after: Option<&str>, reverse| {
+                cells::kv_list(
+                    "cell-a",
+                    &KvListOptions {
+                        prefix: Some("user:".into()),
+                        start_after: start_after.map(Into::into),
+                        limit: Some(2),
+                        reverse: Some(reverse),
+                    },
+                )
+                .unwrap()
+            };
+            let p1 = page(None, false);
+            assert_eq!(
+                p1.entries
+                    .iter()
+                    .map(|e| e.key.as_str())
+                    .collect::<Vec<_>>(),
+                ["user:0", "user:1"]
+            );
+            assert!(p1.truncated);
+            let p3 = page(Some("user:3"), false);
+            assert_eq!(p3.entries.len(), 1);
+            assert!(!p3.truncated);
+            let r1 = page(None, true);
+            assert_eq!(r1.entries[0].key, "user:4");
+
+            // Alarms: due ordering, clearing.
+            let due = cells::list_due_alarms(100, 10).unwrap();
+            assert_eq!(
+                due.iter().map(|d| d.cell_id.as_str()).collect::<Vec<_>>(),
+                ["cell-b"]
+            );
+            assert_eq!(cells::list_due_alarms(1_000, 10).unwrap().len(), 2);
+            cells::transact(tx(&b, None, vec![CellOp::SetAlarm(None)]), 2).unwrap();
+            assert_eq!(cells::get_alarm("cell-b").unwrap(), None);
+
+            // Delete-all only affects its own cell.
+            cells::transact(tx(&b, None, vec![CellOp::KvDeleteAll]), 3).unwrap();
+            assert_eq!(
+                cells::kv_get("cell-a", &["meta".into()]).unwrap(),
+                vec![Some(b"m".to_vec())]
+            );
+
+            // Activation renews the lease and preloads complete state.
+            let act = cells::activate_cell("cell-a".into(), "n".into(), 100, 1 << 20, 10).unwrap();
+            assert_eq!(act.lease.epoch, a.2);
+            assert!(act.complete);
+            assert_eq!(act.entries.len(), 6);
+            assert_eq!(act.alarm_at_ns, Some(500));
+            let partial = cells::activate_cell("cell-a".into(), "n".into(), 100, 20, 10).unwrap();
+            assert!(!partial.complete);
+            assert!(partial.entries.len() < 6);
+            // A different owner cannot activate a live cell.
+            assert!(matches!(
+                cells::activate_cell("cell-a".into(), "other".into(), 100, 0, 20),
+                Err(CellError::LeaseHeldByAnother { .. })
+            ));
+        }
     }
 }

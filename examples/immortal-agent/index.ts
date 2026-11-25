@@ -1,61 +1,116 @@
 import {
-  IcDb,
+  CellNamespace,
   InMemoryCanisterTransport,
-  type FencingToken,
+  InProcessForwarder,
+  type CellState,
+  type CellTransport,
 } from "../../packages/typescript-sdk/src/index.ts";
 
+interface Task {
+  id: string;
+  goal: string;
+  steps: string[];
+  done: boolean;
+}
+
 /**
- * Immortal Agent — 1 Agent = 1 Cell.
- * Even if the execution node crashes, a new node acquires the next fencing
- * epoch and resumes from the committed on-chain state.
+ * Immortal Agent — 1 Agent = 1 Durable Cell.
+ *
+ * The agent's memory and task progress live in the ic-cell canister. Work is
+ * driven by an alarm, so if the node running the agent dies, another node
+ * picks the alarm up (`pollAlarms`) and continues from the last committed step.
  */
 export class ImmortalAgent {
-  private readonly cellId: string;
-  private readonly nodeId: string;
-  private readonly env: { IC_DB: IcDb };
-  private fencing?: FencingToken;
+  private readonly state: CellState;
 
-  constructor(cellId: string, nodeId: string, env: { IC_DB: IcDb }) {
-    this.cellId = cellId;
-    this.nodeId = nodeId;
-    this.env = env;
+  constructor(state: CellState) {
+    this.state = state;
   }
 
-  async start(ttlNs = 5_000n): Promise<bigint> {
-    const lease = await this.env.IC_DB.acquireLease(this.cellId, this.nodeId, ttlNs);
-    this.fencing = { cellId: lease.cellId, ownerId: lease.ownerId, epoch: lease.epoch };
-    return lease.epoch;
+  async remember(key: string, value: string): Promise<void> {
+    await this.state.storage.put(`memory:${key}`, value);
   }
 
-  async saveMemory(key: string, value: string, idempotencyKey?: string): Promise<void> {
-    await this.env.IC_DB.execute("INSERT INTO memories (key, value) VALUES (?, ?)", [key, value], {
-      idempotencyKey,
-      fencing: this.fencing,
-    });
+  async recall(key: string): Promise<string | undefined> {
+    return this.state.storage.get<string>(`memory:${key}`);
   }
 
-  async recallMemory(key: string): Promise<string | null> {
-    const rows = await this.env.IC_DB.query("SELECT key, value FROM memories WHERE key = ?", [key]);
-    return rows.length > 0 ? String(rows[0][1]) : null;
+  async assign(goal: string, steps: number): Promise<string> {
+    const id = `task-${Date.now()}`;
+    const task: Task = { id, goal, steps: Array.from({ length: steps }, (_, i) => `step ${i + 1}`), done: false };
+    await this.state.storage.put(`task:${id}`, task);
+    await this.state.storage.put("progress", { task: id, next: 0 });
+    await this.state.storage.setAlarm(Date.now());
+    return id;
+  }
+
+  async status(): Promise<{ next: number; total: number; done: boolean } | null> {
+    const progress = await this.state.storage.get<{ task: string; next: number }>("progress");
+    if (!progress) return null;
+    const task = (await this.state.storage.get<Task>(`task:${progress.task}`))!;
+    return { next: progress.next, total: task.steps.length, done: task.done };
+  }
+
+  /** Executes one step per alarm; each step commits atomically with its progress. */
+  async alarm(): Promise<void> {
+    const progress = await this.state.storage.get<{ task: string; next: number }>("progress");
+    if (!progress) return;
+    const task = (await this.state.storage.get<Task>(`task:${progress.task}`))!;
+    if (progress.next >= task.steps.length) {
+      await this.state.storage.put(`task:${task.id}`, { ...task, done: true });
+      return;
+    }
+    await this.state.storage.put(`log:${task.id}:${progress.next}`, `did ${task.steps[progress.next]}`);
+    await this.state.storage.put("progress", { ...progress, next: progress.next + 1 });
+    await this.state.storage.setAlarm(Date.now());
   }
 }
 
+export function agents(transport: CellTransport, nodeId: string, forwarder?: InProcessForwarder) {
+  const ns = new CellNamespace({
+    transport,
+    nodeId,
+    forwarder,
+    env: {},
+    leaseTtlMs: 2_000,
+    // Timers drive alarms in production; this demo steps them by hand.
+    autoTimers: false,
+    create: (state) => new ImmortalAgent(state),
+  });
+  forwarder?.register(ns);
+  return ns;
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const transport = new InMemoryCanisterTransport(1_000n);
-  const env = { IC_DB: new IcDb(transport) };
+  const canister = new InMemoryCanisterTransport();
+  // The demo canister follows wall-clock time plus a skew we use to "wait".
+  let skewMs = 0;
+  const syncClock = () => canister.setTime(BigInt(Date.now() + skewMs) * 1_000_000n);
+  const step = async (ns: { pollAlarms(): Promise<number> }) => {
+    syncClock();
+    return ns.pollAlarms();
+  };
 
-  // Node A runs the agent and commits memory on-chain
-  const agentOnNodeA = new ImmortalAgent("agent-001", "celld-node-a", env);
-  const epoch1 = await agentOnNodeA.start(5_000n);
-  await agentOnNodeA.saveMemory("mission", "Run anywhere. Persist on-chain.", "m-1");
-  console.log(`[node-a epoch=${epoch1}] saved memory`);
+  const cluster = new InProcessForwarder();
+  const nodeA = agents(canister, "celld-node-a", cluster);
+  syncClock();
+  const agent = nodeA.get<ImmortalAgent>("agent-001");
+  await agent.remember("mission", "Run anywhere. Persist on-chain.");
+  await agent.assign("write a report", 5);
+  await step(nodeA);
+  await step(nodeA);
+  console.log("[node-a] progress:", await agent.status());
 
-  // Node A disappears; lease expires
-  transport.advanceTime(5_000n);
+  // node-a crashes without releasing its lease; time passes beyond the TTL.
+  cluster.unregister("celld-node-a");
+  skewMs += 3_000;
 
-  // Node B boots a fresh instance and recovers the committed memory
-  const agentOnNodeB = new ImmortalAgent("agent-001", "celld-node-b", env);
-  const epoch2 = await agentOnNodeB.start(5_000n);
-  const recalled = await agentOnNodeB.recallMemory("mission");
-  console.log(`[node-b epoch=${epoch2}] recovered memory: "${recalled}"`);
+  const nodeB = agents(canister, "celld-node-b", cluster);
+  while ((await step(nodeB)) > 0) {
+    // keep stepping until no alarm is due
+  }
+  const resumed = nodeB.get<ImmortalAgent>("agent-001");
+  console.log("[node-b] recalled:", await resumed.recall("mission"));
+  console.log("[node-b] progress:", await resumed.status());
+  await nodeB.shutdown();
 }
