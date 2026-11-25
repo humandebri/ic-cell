@@ -31,6 +31,9 @@ pub enum CellError {
         reason: String,
     },
     Unauthorized,
+    PreconditionFailed {
+        reason: String,
+    },
     Transport(String),
     InvalidArgument(String),
     Database(String),
@@ -141,4 +144,99 @@ pub struct ReplicationState {
 pub struct InitArgs {
     /// Principals (besides controllers) allowed to call the canister.
     pub authorized_callers: Option<Vec<candid::Principal>>,
+}
+
+/// `(cell_id, owner_id, epoch)` as returned by `acquire_lease`.
+pub type Fencing = (String, String, u64);
+
+/// One step of an atomic cell transaction.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum CellOp {
+    KvPut {
+        key: String,
+        value: Vec<u8>,
+    },
+    KvDelete {
+        key: String,
+    },
+    KvDeleteAll,
+    /// `Some(at_ns)` sets the cell alarm (Unix ns); `None` clears it.
+    SetAlarm(Option<u64>),
+    /// Aborts the whole transaction unless the key currently holds `expected`
+    /// (`None` = key must be absent).
+    AssertKv {
+        key: String,
+        expected: Option<Vec<u8>>,
+    },
+    /// Runs SQL inside the same transaction; rows (e.g. `RETURNING`) are
+    /// returned. SQL tables are shared by all cells.
+    Sql {
+        sql: String,
+        args: Vec<SqlValue>,
+    },
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TransactRequest {
+    pub fencing: Fencing,
+    pub idempotency_key: Option<String>,
+    pub ops: Vec<CellOp>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct OpResult {
+    pub rows_affected: u64,
+    pub rows: Vec<Vec<SqlValue>>,
+}
+
+impl OpResult {
+    pub fn affected(rows_affected: u64) -> Self {
+        Self {
+            rows_affected,
+            rows: Vec::new(),
+        }
+    }
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TransactResult {
+    pub results: Vec<OpResult>,
+    pub idempotent_replay: bool,
+    pub epoch: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct KvEntry {
+    pub key: String,
+    pub value: Vec<u8>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct KvListOptions {
+    pub prefix: Option<String>,
+    /// Exclusive cursor (the last key of the previous page).
+    pub start_after: Option<String>,
+    pub limit: Option<u32>,
+    pub reverse: Option<bool>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct KvListResult {
+    pub entries: Vec<KvEntry>,
+    pub truncated: bool,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DueAlarm {
+    pub cell_id: String,
+    pub at_ns: u64,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Activation {
+    pub lease: LeaseRecord,
+    pub entries: Vec<KvEntry>,
+    /// `true` when `entries` is the cell's complete key/value state.
+    pub complete: bool,
+    pub alarm_at_ns: Option<u64>,
 }

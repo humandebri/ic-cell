@@ -53,7 +53,10 @@ test("IcDb enforces fencing epoch and idempotency keys", async () => {
 
 test("CandidActorTransport encodes SQL params, routes consistency, and maps Candid errors", async () => {
   const calls: string[] = [];
-  const fakeActor: CanisterActor = {
+  const fakeActor: Pick<
+    CanisterActor,
+    "acquire_lease" | "release_lease" | "sql_execute" | "sql_query_strong" | "sql_query_eventual"
+  > = {
     async acquire_lease(cellId, ownerId, ttlNs) {
       calls.push(`acquire:${cellId}:${ownerId}:${ttlNs}`);
       return {
@@ -84,7 +87,7 @@ test("CandidActorTransport encodes SQL params, routes consistency, and maps Cand
     },
   };
 
-  const db = new IcDb(new CandidActorTransport(fakeActor));
+  const db = new IcDb(new CandidActorTransport(fakeActor as CanisterActor));
   const lease = await db.acquireLease("c1", "node-x", 100n);
   assert.equal(lease.epoch, 3n);
 

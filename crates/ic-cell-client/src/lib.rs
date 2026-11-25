@@ -8,8 +8,9 @@ pub mod object_store;
 pub mod object_store_adapter;
 
 pub use ic_cell_canister::types::{
-    CellError, ExecResult, LeaseRecord, LtxDeltaRequest, ObjectMeta, ObjectRecord, PageDelta,
-    QueryResult, ReplicationState, SqlValue,
+    Activation, CellError, CellOp, DueAlarm, ExecResult, KvEntry, KvListOptions, KvListResult,
+    LeaseRecord, LtxDeltaRequest, ObjectMeta, ObjectRecord, OpResult, PageDelta, QueryResult,
+    ReplicationState, SqlValue, TransactRequest, TransactResult,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +137,32 @@ pub trait IcCellTransport {
 
     /// Discards chunks of an uncommitted chunked object upload.
     fn abort_chunked_upload(&self, upload_id: &str) -> Result<u64, CellError>;
+
+    // ---- Durable Cells ----
+
+    /// Acquires/renews the cell lease and preloads its state.
+    fn activate_cell(
+        &self,
+        cell_id: String,
+        owner_id: String,
+        ttl_ns: u64,
+        preload_bytes: u64,
+    ) -> Result<Activation, CellError>;
+
+    /// Atomically applies fenced cell ops.
+    fn cell_transact(&self, req: TransactRequest) -> Result<TransactResult, CellError>;
+
+    fn cell_kv_get(
+        &self,
+        cell_id: &str,
+        keys: Vec<String>,
+    ) -> Result<Vec<Option<Vec<u8>>>, CellError>;
+
+    fn cell_kv_list(&self, cell_id: &str, opts: KvListOptions) -> Result<KvListResult, CellError>;
+
+    fn cell_get_alarm(&self, cell_id: &str) -> Result<Option<u64>, CellError>;
+
+    fn list_due_alarms(&self, limit: u32) -> Result<Vec<DueAlarm>, CellError>;
 }
 
 pub struct IcCellClient<T: IcCellTransport> {

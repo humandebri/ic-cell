@@ -29,6 +29,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: oven-sh/setup-bun@v2
+      - name: Install TypeScript SDK dev dependencies (for the live TS E2E)
+        working-directory: packages/typescript-sdk
+        run: bun install --frozen-lockfile
       - name: Build canister wasm
         run: cargo build -p ic-cell-canister --target wasm32-unknown-unknown --release
       - name: Install PocketIC server
@@ -44,14 +51,23 @@ jobs:
 
   typescript:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/typescript-sdk
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - uses: oven-sh/setup-bun@v2
+      - name: Install dev dependencies
+        run: bun install --frozen-lockfile
+      - name: Type-check SDK, tests and examples
+        run: bun x tsc -p .
       - name: Run TypeScript SDK tests
-        run: node --experimental-strip-types --test packages/typescript-sdk/test/sdk.test.ts
+        run: node --experimental-strip-types --test test/*.test.ts
       - name: Run examples
+        working-directory: .
         run: |
           node --experimental-strip-types examples/durable-counter/index.ts
           node --experimental-strip-types examples/immortal-agent/index.ts

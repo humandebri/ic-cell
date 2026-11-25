@@ -1,6 +1,7 @@
 use crate::{
-    CellError, Consistency, ExecResult, FencingToken, IcCellTransport, LeaseRecord,
-    LtxDeltaRequest, ObjectMeta, ObjectRecord, PageDelta, QueryResult, ReplicationState, SqlValue,
+    Activation, CellError, Consistency, DueAlarm, ExecResult, FencingToken, IcCellTransport,
+    KvListOptions, KvListResult, LeaseRecord, LtxDeltaRequest, ObjectMeta, ObjectRecord, PageDelta,
+    QueryResult, ReplicationState, SqlValue, TransactRequest, TransactResult,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -200,5 +201,45 @@ impl IcCellTransport for InProcessTransport {
 
     fn abort_chunked_upload(&self, upload_id: &str) -> Result<u64, CellError> {
         ic_cell_canister::storage::abort_chunked_upload(upload_id)
+    }
+
+    fn activate_cell(
+        &self,
+        cell_id: String,
+        owner_id: String,
+        ttl_ns: u64,
+        preload_bytes: u64,
+    ) -> Result<Activation, CellError> {
+        ic_cell_canister::cells::activate_cell(
+            cell_id,
+            owner_id,
+            ttl_ns,
+            preload_bytes,
+            self.now_ns(),
+        )
+    }
+
+    fn cell_transact(&self, req: TransactRequest) -> Result<TransactResult, CellError> {
+        ic_cell_canister::cells::transact(req, self.now_ns())
+    }
+
+    fn cell_kv_get(
+        &self,
+        cell_id: &str,
+        keys: Vec<String>,
+    ) -> Result<Vec<Option<Vec<u8>>>, CellError> {
+        ic_cell_canister::cells::kv_get(cell_id, &keys)
+    }
+
+    fn cell_kv_list(&self, cell_id: &str, opts: KvListOptions) -> Result<KvListResult, CellError> {
+        ic_cell_canister::cells::kv_list(cell_id, &opts)
+    }
+
+    fn cell_get_alarm(&self, cell_id: &str) -> Result<Option<u64>, CellError> {
+        ic_cell_canister::cells::get_alarm(cell_id)
+    }
+
+    fn list_due_alarms(&self, limit: u32) -> Result<Vec<DueAlarm>, CellError> {
+        ic_cell_canister::cells::list_due_alarms(self.now_ns(), limit)
     }
 }

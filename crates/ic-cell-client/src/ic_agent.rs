@@ -1,8 +1,9 @@
 //! Live ICP / local `dfx` replica transport backed by `ic-agent`.
 
 use crate::{
-    CellError, Consistency, ExecResult, FencingToken, IcCellTransport, LeaseRecord,
-    LtxDeltaRequest, ObjectMeta, ObjectRecord, PageDelta, QueryResult, ReplicationState, SqlValue,
+    Activation, CellError, Consistency, DueAlarm, ExecResult, FencingToken, IcCellTransport,
+    KvListOptions, KvListResult, LeaseRecord, LtxDeltaRequest, ObjectMeta, ObjectRecord, PageDelta,
+    QueryResult, ReplicationState, SqlValue, TransactRequest, TransactResult,
 };
 use candid::{decode_one, encode_args, CandidType, Principal};
 use ic_agent::{Agent, Identity};
@@ -324,5 +325,42 @@ impl IcCellTransport for IcAgentTransport {
 
     fn abort_chunked_upload(&self, upload_id: &str) -> Result<u64, CellError> {
         self.call_update("abort_chunked_upload", enc((upload_id,))?)
+    }
+
+    fn activate_cell(
+        &self,
+        cell_id: String,
+        owner_id: String,
+        ttl_ns: u64,
+        preload_bytes: u64,
+    ) -> Result<Activation, CellError> {
+        self.call_update(
+            "activate_cell",
+            enc((cell_id, owner_id, ttl_ns, preload_bytes))?,
+        )
+    }
+
+    fn cell_transact(&self, req: TransactRequest) -> Result<TransactResult, CellError> {
+        self.call_update("cell_transact", enc((req,))?)
+    }
+
+    fn cell_kv_get(
+        &self,
+        cell_id: &str,
+        keys: Vec<String>,
+    ) -> Result<Vec<Option<Vec<u8>>>, CellError> {
+        self.call_update("cell_kv_get", enc((cell_id, keys))?)
+    }
+
+    fn cell_kv_list(&self, cell_id: &str, opts: KvListOptions) -> Result<KvListResult, CellError> {
+        self.call_update("cell_kv_list", enc((cell_id, opts))?)
+    }
+
+    fn cell_get_alarm(&self, cell_id: &str) -> Result<Option<u64>, CellError> {
+        self.call_update("cell_get_alarm", enc((cell_id,))?)
+    }
+
+    fn list_due_alarms(&self, limit: u32) -> Result<Vec<DueAlarm>, CellError> {
+        self.call_update("list_due_alarms", enc((limit,))?)
     }
 }

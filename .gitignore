@@ -1,6 +1,6 @@
 /target
 /.dfx
-/node_modules
+node_modules/
 .DS_Store
 *.wasm
 *.wasm.gz

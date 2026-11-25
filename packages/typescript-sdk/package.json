@@ -7,6 +7,15 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "node --experimental-strip-types --test test/sdk.test.ts"
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc -p ."
+  },
+  "devDependencies": {
+    "@dfinity/agent": "2.4.1",
+    "@dfinity/candid": "2.4.1",
+    "@dfinity/identity": "2.4.1",
+    "@dfinity/principal": "2.4.1",
+    "@types/node": "22.10.2",
+    "typescript": "5.6.3"
   }
 }
